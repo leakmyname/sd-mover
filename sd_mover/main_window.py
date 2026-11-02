@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 
+from PyQt5.QtCore import QThread, pyqtSignal
+
 from .constants import (
     POLL_INTERVAL_MS, STABILIZE_CHECKS, WARNING_THRESHOLD_GB,
     DEFAULT_PREFIX, DEFAULT_AUTO_EJECT, DEFAULT_AUTO_DELETE,
@@ -63,6 +65,8 @@ class MainWindow(QMainWindow):
         self.delay_remaining = {}    # letter -> int (剩余秒数)
         self.delay_tick = {}         # letter -> QTimer (每秒更新显示)
         self._last_drive_set = None  # 用于判断是否需要刷新序列号缓存
+        self._ready_to_start = set()  # 已过延迟、待全局规划的SD卡盘符
+        self._serial_refreshing = False  # 后台序列号刷新中
         self.config = self._load_config()
         self.log_mgr = LogManager(self._log_dir())
         self.log_mgr.increment_session()
@@ -379,23 +383,41 @@ class MainWindow(QMainWindow):
             f"{len(stats.get('drives_used', []))}个目标盘"
         )
 
+    def _on_serial_refresh_done(self):
+        """后台序列号刷新完成 — 从新缓存更新界面"""
+        self._serial_refreshing = False
+        for letter, d in self.ext_drives.items():
+            d.hw_serial = get_cached_usb_serial(letter)
+        for letter, d in self.sd_cards.items():
+            d.reader_serial = get_cached_reader_serial(letter)
+        for letter in list(self.ext_drives.keys()):
+            sn = get_cached_usb_serial(letter)
+            if sn:
+                self._register_serial(sn, is_reader=False)
+        for letter in list(self.sd_cards.keys()):
+            sn = get_cached_reader_serial(letter)
+            if sn:
+                self._register_serial(sn, is_reader=True)
+        self._update_ext_panel()
+
     def _poll_drives(self):
         try:
             drives = scan_drives()
         except Exception as e:
             self._log(f"扫描驱动器失败: {e}")
             return
-        # 批量刷新序列号缓存 (只在盘符集合变化时才真正查询, 避免频繁开 PowerShell)
+        # 批量刷新序列号缓存 (后台线程, 不阻塞UI)
         all_letters = [d.letter for d in drives]
         drive_key = frozenset(all_letters)
         if drive_key != self._last_drive_set:
             self._last_drive_set = drive_key
-            refresh_serial_cache(all_letters)
+            if not self._serial_refreshing:
+                self._serial_refreshing = True
+                refresh_serial_cache(all_letters, callback=self._on_serial_refresh_done)
         # 从缓存填充序列号
         for d in drives:
             d.hw_serial = get_cached_usb_serial(d.letter)
             d.reader_serial = get_cached_reader_serial(d.letter)
-            # 注册新序列号到管理页
             if d.hw_serial:
                 self._register_serial(d.hw_serial, is_reader=False)
             if d.reader_serial:
@@ -449,6 +471,7 @@ class MainWindow(QMainWindow):
                 del self.sd_cards[letter]
                 self.stable_count.pop(letter, None)
                 self.waiting_set.discard(letter)
+                self._ready_to_start.discard(letter)
                 self._cancel_delay(letter)
                 self.pending_queue = [s for s in self.pending_queue if s.letter != letter]
                 self._remove_sd_row(letter)
@@ -497,21 +520,39 @@ class MainWindow(QMainWindow):
         self.delay_remaining.pop(letter, None)
 
     def _check_and_start(self, d):
-        """空间检查策略: 空间紧张时优先保证一张卡先移动完"""
-        data_size = d.total - d.free
+        """空间检查策略: 加入待规划集, 触发全局优先级规划"""
+        self._ready_to_start.add(d.letter)
+        self._plan_and_start()
+
+    def _plan_and_start(self):
+        """全局空间预算: 按数据大小降序, 累计不超过 total_free - threshold"""
+        ready = []
+        for letter in list(self._ready_to_start):
+            if letter in self.processing or letter in self.waiting_set:
+                continue
+            sd = self.sd_cards.get(letter)
+            if sd:
+                ready.append(sd)
+        if not ready:
+            return
+        # 按数据量降序: 大卡优先
+        ready.sort(key=lambda x: x.total - x.free, reverse=True)
         total_free = sum(dr.free for dr in self.ext_drives.values())
         active_bytes = sum(
             (w.sd_info.total - w.sd_info.free)
             for w in self.workers.values()
         )
-        available_for_this = total_free - active_bytes
-        if available_for_this <= 0:
-            self._queue_sd(d)
-            return
-        if data_size > available_for_this:
-            self._queue_sd(d)
-            return
-        self._start_transfer(d)
+        threshold = WARNING_THRESHOLD_GB * 1024 ** 3
+        available = total_free - active_bytes - threshold
+        for card in ready:
+            data_size = card.total - card.free
+            if data_size <= available:
+                available -= data_size
+                self._ready_to_start.discard(card.letter)
+                self._start_transfer(card)
+            else:
+                self._ready_to_start.discard(card.letter)
+                self._queue_sd(card)
 
     def _queue_sd(self, d):
         """将SD卡加入等待队列, 空间紧张时小卡优先"""
@@ -527,27 +568,13 @@ class MainWindow(QMainWindow):
         )
 
     def _try_start_queued(self):
-        """尝试启动队列中能放下的SD卡"""
-        if not self.pending_queue:
-            return
-        total_free = sum(dr.free for dr in self.ext_drives.values())
-        active_bytes = sum(
-            (w.sd_info.total - w.sd_info.free)
-            for w in self.workers.values()
-        )
-        available = total_free - active_bytes
-        started = []
+        """新硬盘连接或传输完成后, 重新规划所有等待中的SD卡"""
+        # 将排队中的卡移回待规划集
         for d in self.pending_queue:
-            data_size = d.total - d.free
-            if data_size <= available:
-                available -= data_size
-                started.append(d)
-                self.waiting_set.discard(d.letter)
-                self._start_transfer(d)
-        for d in started:
-            self.pending_queue.remove(d)
-        if started:
-            self._log(f"队列启动了 {len(started)} 张SD卡, 剩余 {len(self.pending_queue)} 张排队")
+            self._ready_to_start.add(d.letter)
+        self.pending_queue.clear()
+        self.waiting_set.clear()
+        self._plan_and_start()
 
     def _update_ext_panel(self):
         self.ext_table.setRowCount(0)
@@ -740,23 +767,21 @@ class MainWindow(QMainWindow):
         row = self._find_row(letter)
         if row < 0:
             return
-        pct = int(copied / total * 100) if total > 0 else 0
+        # 总进度 (用于信息文本, 保留1位小数避免一直显示0%)
+        overall_1dp = (copied / total * 100) if total > 0 else 0
+        # 单文件进度 (用于进度条, 更新更频繁)
+        file_pct = int(file_copied / file_total * 100) if file_total > 0 else 0
         bar = self.sd_table.cellWidget(row, 4)
         if bar:
-            bar.setValue(pct)
-            bar.setFormat(f"{pct}%")
-        # 总进度 ETA
+            bar.setValue(file_pct)
+            bar.setFormat(f"{file_pct}%")
+        # ETA
         eta_str = ""
         if speed > 0 and total > 0:
             remaining_bytes = total - copied
             remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
-            eta_str = f" | 剩余: {format_eta(remaining_seconds)}"
-        # 单文件进度
-        file_pct_str = ""
-        if file_total > 0 and file_copied >= 0:
-            file_pct = int(file_copied / file_total * 100)
-            file_pct_str = f" | 文件: {file_pct}%"
-        info = f"{format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str}{file_pct_str}"
+            eta_str = f" | 预估: {format_eta(remaining_seconds)}"
+        info = f"总进度: {overall_1dp:.1f}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str}"
         if fname:
             info = f"{fname}\n{info}"
         self.sd_table.item(row, 5).setText(info)

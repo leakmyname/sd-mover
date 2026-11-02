@@ -3,6 +3,7 @@
 import ctypes
 import json
 import subprocess
+import threading
 
 # Windows API 常量
 GENERIC_READ = 0x80000000
@@ -22,9 +23,15 @@ DRIVE_CDROM = 5
 _kernel32 = ctypes.windll.kernel32
 _kernel32.CreateFileW.restype = ctypes.c_void_p
 
+# 隐藏子进程(PowerShell)窗口, 避免 STARTUPINFO 闪现
+_CREATE_NO_WINDOW = 0x08000000
+
 # ── 序列号缓存 (批量查询, 避免频繁开 PowerShell) ──
 _serial_cache = {}        # letter -> {"usb_serial", "disk_serial", "reader_serial"}
 _cache_drive_key = None   # 上次查询时的盘符集合, 用于判断是否需要刷新
+_refresh_lock = threading.Lock()
+_refresh_thread = None    # 当前后台刷新线程
+_refresh_callback = None  # 刷新完成回调
 
 
 def get_logical_drives():
@@ -124,7 +131,8 @@ def _eject_shell(drive_letter):
         )
         subprocess.run(
             ['powershell', '-NoProfile', '-Command', ps],
-            capture_output=True, timeout=15
+            capture_output=True, timeout=15,
+            creationflags=_CREATE_NO_WINDOW
         )
         return True
     except Exception:
@@ -133,25 +141,7 @@ def _eject_shell(drive_letter):
 
 # ── 序列号批量查询 (替代原来每次开 PowerShell) ──
 
-def refresh_serial_cache(letters=None):
-    """批量查询所有盘符的 USB 序列号 — 只开一次 PowerShell
-
-    letters: 要查询的盘符列表, None=自动获取全部
-    结果存入 _serial_cache, key=盘符
-    每个值: {"usb_serial", "disk_serial", "reader_serial"}
-    """
-    global _cache_drive_key
-    if letters is None:
-        letters = get_logical_drives()
-    drive_key = frozenset(letters)
-    if drive_key == _cache_drive_key and _serial_cache:
-        return  # 缓存有效, 不重复查询
-    _cache_drive_key = drive_key
-    if not letters:
-        _serial_cache.clear()
-        return
-    letters_str = ",".join(letters)
-    ps_script = '''
+_PS_SCRIPT_TEMPLATE = '''
 $ErrorActionPreference='SilentlyContinue'
 $result = @{}
 $letters = '%s'.Split(',')
@@ -161,16 +151,46 @@ foreach ($letter in $letters) {
     if ($part) {
         $disk = Get-Disk -Number $part.DiskNumber 2>$null
         if ($disk -and $disk.SerialNumber) {
-            $info.disk_serial = $disk.SerialNumber.Trim()
+            $info.disk_serial = ($disk.SerialNumber -replace '\\s','').Trim()
         }
         $diskNum = $part.DiskNumber
         $diskObj = Get-CimInstance Win32_DiskDrive | Where-Object {$_.Index -eq $diskNum}
         if ($diskObj -and $diskObj.PNPDeviceID) {
             $pnp = $diskObj.PNPDeviceID
-            if ($pnp -like 'USB\\*') {
+            # Method 1: Get-PnpDevice parent tree traversal (best for USB enclosures)
+            try {
+                $dev = Get-PnpDevice -InstanceId $pnp 2>$null
+                if ($dev) {
+                    $current = $dev
+                    for ($i = 0; $i -lt 20; $i++) {
+                        $instId = $current.InstanceId
+                        if ($instId -like 'USB\\*') {
+                            $parts = $instId.Split('\\')
+                            if ($parts.Length -ge 3 -and $parts[2] -ne '') {
+                                $serial = $parts[2]
+                                if ($serial -notmatch '^(root|hub|0&0|0000)$') {
+                                    $info.usb_serial = $serial
+                                    $info.reader_serial = $serial
+                                    break
+                                }
+                            }
+                        }
+                        $parentId = $current.ParentDeviceId
+                        if (-not $parentId -or $parentId -eq $instId) { break }
+                        $current = Get-PnpDevice -InstanceId $parentId 2>$null
+                        if (-not $current) { break }
+                    }
+                }
+            } catch {}
+            # Method 2: Direct PNP check
+            if (-not $info.usb_serial -and $pnp -like 'USB\\*') {
                 $parts = $pnp.Split('\\')
-                if ($parts.Length -ge 3) { $info.usb_serial = $parts[2] }
+                if ($parts.Length -ge 3 -and $parts[2] -ne '') {
+                    $info.usb_serial = $parts[2]
+                    $info.reader_serial = $parts[2]
+                }
             }
+            # Method 3: Win32_USBControllerDevice fallback
             if (-not $info.usb_serial) {
                 $usbDevs = Get-CimInstance Win32_USBControllerDevice
                 foreach ($usbDev in $usbDevs) {
@@ -180,35 +200,75 @@ foreach ($letter in $letters) {
                         $antPnp = ($ant -replace '.*DeviceID="([^"]*)".*','$1')
                         if ($antPnp -like 'USB\\*') {
                             $antParts = $antPnp.Split('\\')
-                            if ($antParts.Length -ge 3) { $info.usb_serial = $antParts[2] }
+                            if ($antParts.Length -ge 3 -and $antParts[2] -ne '') {
+                                $info.usb_serial = $antParts[2]
+                                $info.reader_serial = $antParts[2]
+                            }
                         }
                     }
                 }
-            }
-            # SD 读卡器: 可移动设备自身 PNPDeviceID
-            if ($diskObj.MediaType -or $diskObj.InterfaceType) {
-                $isRemovableDisk = ($diskObj.MediaType -eq 'Removable Media') -or ($diskObj.InterfaceType -or $true)
-            }
-            $rpnp = $diskObj.PNPDeviceID
-            if ($rpnp -like 'USB\\*') {
-                $rparts = $rpnp.Split('\\')
-                if ($rparts.Length -ge 3) { $info.reader_serial = $rparts[2] }
             }
         }
     }
     $result[$letter] = $info
 }
 Write-Output ($result | ConvertTo-Json -Compress -Depth 3)
-''' % letters_str
+'''
+
+
+def refresh_serial_cache(letters=None, callback=None):
+    """批量查询所有盘符的 USB 序列号 — 只开一次 PowerShell
+
+    letters: 要查询的盘符列表, None=自动获取全部
+    callback: 刷新完成后的回调函数(无参数), 用于后台刷新通知UI
+
+    结果存入 _serial_cache, key=盘符
+    每个值: {"usb_serial", "disk_serial", "reader_serial"}
+    """
+    global _cache_drive_key, _refresh_thread, _refresh_callback
+    if letters is None:
+        letters = get_logical_drives()
+    drive_key = frozenset(letters)
+    with _refresh_lock:
+        if drive_key == _cache_drive_key and _serial_cache:
+            # 缓存有效, 立即回调(若有)
+            if callback:
+                callback()
+            return
+        # 如果已有后台线程在跑且盘符集合相同, 不重复启动
+        if _refresh_thread and _refresh_thread.is_alive():
+            # 记录回调, 等现有线程完成后触发
+            if callback:
+                _refresh_callback = callback
+            return
+        _cache_drive_key = drive_key
+        if callback:
+            _refresh_callback = callback
+        _refresh_thread = threading.Thread(
+            target=_do_refresh, args=(list(letters),), daemon=True
+        )
+        _refresh_thread.start()
+
+
+def _do_refresh(letters):
+    """后台线程: 实际执行 PowerShell 查询"""
+    global _refresh_callback
     try:
+        if not letters:
+            with _refresh_lock:
+                _serial_cache.clear()
+            return
+        letters_str = ",".join(letters)
+        ps_script = _PS_SCRIPT_TEMPLATE % letters_str
         result = subprocess.run(
             ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script],
-            capture_output=True, timeout=30, text=True
+            capture_output=True, timeout=60, text=True,
+            creationflags=_CREATE_NO_WINDOW
         )
         raw = result.stdout.strip()
+        new_cache = {}
         if raw:
             data = json.loads(raw)
-            new_cache = {}
             if isinstance(data, dict):
                 for k, v in data.items():
                     if isinstance(v, dict):
@@ -219,10 +279,25 @@ Write-Output ($result | ConvertTo-Json -Compress -Depth 3)
                         }
                     else:
                         new_cache[k] = {"usb_serial": "", "disk_serial": "", "reader_serial": ""}
+        with _refresh_lock:
             _serial_cache.clear()
             _serial_cache.update(new_cache)
+        cb = _refresh_callback
+        _refresh_callback = None
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
     except Exception:
-        pass  # 保持旧缓存
+        # 保持旧缓存, 触发回调
+        cb = _refresh_callback
+        _refresh_callback = None
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
 
 
 def get_cached_usb_serial(letter):
@@ -238,9 +313,57 @@ def get_cached_reader_serial(letter):
 
 
 def get_hardware_serial(drive_letter):
-    """获取 USB 硬盘盒序列号 (兼容旧调用, 使用缓存)"""
-    refresh_serial_cache()
+    """获取 USB 硬盘盒序列号 (兼容旧调用, 同步刷新)"""
+    # 对于兼容调用, 做一次同步刷新(不带回调)
+    with _refresh_lock:
+        drive_key = frozenset([drive_letter])
+        if drive_key != _cache_drive_key or not _serial_cache:
+            pass  # 落到下面的同步刷新
+        else:
+            return get_cached_usb_serial(drive_letter)
+    # 同步刷新(用于兼容旧接口)
+    global _refresh_thread
+    if _refresh_thread and _refresh_thread.is_alive():
+        _refresh_thread.join(timeout=60)
+    # 直接同步执行
+    _do_refresh_sync([drive_letter])
     return get_cached_usb_serial(drive_letter)
+
+
+def _do_refresh_sync(letters):
+    """同步版刷新(兼容旧接口用)"""
+    global _cache_drive_key
+    if not letters:
+        _serial_cache.clear()
+        return
+    letters_str = ",".join(letters)
+    ps_script = _PS_SCRIPT_TEMPLATE % letters_str
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script],
+            capture_output=True, timeout=60, text=True,
+            creationflags=_CREATE_NO_WINDOW
+        )
+        raw = result.stdout.strip()
+        new_cache = {}
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        new_cache[k] = {
+                            "usb_serial": v.get("usb_serial", "") or "",
+                            "disk_serial": v.get("disk_serial", "") or "",
+                            "reader_serial": v.get("reader_serial", "") or "",
+                        }
+                    else:
+                        new_cache[k] = {"usb_serial": "", "disk_serial": "", "reader_serial": ""}
+        with _refresh_lock:
+            _serial_cache.clear()
+            _serial_cache.update(new_cache)
+            _cache_drive_key = frozenset(letters)
+    except Exception:
+        pass
 
 
 def check_single_instance(name="SDMover_SingleInstance_Mutex"):
