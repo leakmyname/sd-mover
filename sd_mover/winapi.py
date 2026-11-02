@@ -32,6 +32,8 @@ _cache_drive_key = None   # 上次查询时的盘符集合, 用于判断是否�
 _refresh_lock = threading.Lock()
 _refresh_thread = None    # 当前后台刷新线程
 _refresh_callback = None  # 刷新完成回调
+_refresh_done_flag = False  # 刷新完成标志(供UI线程轮询)
+_refresh_done_drives = None  # 刷新完成时的盘符集合
 
 
 def get_logical_drives():
@@ -245,14 +247,14 @@ def refresh_serial_cache(letters=None, callback=None):
         if callback:
             _refresh_callback = callback
         _refresh_thread = threading.Thread(
-            target=_do_refresh, args=(list(letters),), daemon=True
+            target=_do_refresh, args=(list(letters), callback), daemon=True
         )
         _refresh_thread.start()
 
 
 def _do_refresh(letters):
     """后台线程: 实际执行 PowerShell 查询"""
-    global _refresh_callback
+    global _refresh_callback, _refresh_done_flag, _refresh_done_drives
     try:
         if not letters:
             with _refresh_lock:
@@ -282,22 +284,13 @@ def _do_refresh(letters):
         with _refresh_lock:
             _serial_cache.clear()
             _serial_cache.update(new_cache)
-        cb = _refresh_callback
-        _refresh_callback = None
-        if cb:
-            try:
-                cb()
-            except Exception:
-                pass
+            _refresh_done_flag = True
+            _refresh_done_drives = frozenset(letters)
     except Exception:
         # 保持旧缓存, 触发回调
-        cb = _refresh_callback
-        _refresh_callback = None
-        if cb:
-            try:
-                cb()
-            except Exception:
-                pass
+        with _refresh_lock:
+            _refresh_done_flag = True
+            _refresh_done_drives = frozenset(letters)
 
 
 def get_cached_usb_serial(letter):
@@ -376,3 +369,13 @@ def check_single_instance(name="SDMover_SingleInstance_Mutex"):
         return True
     except Exception:
         return True
+def pop_refresh_done():
+    """UI线程轮询: 检查后台刷新是否完成, 返回 True 表示已完成(并清除标志)"""
+    global _refresh_done_flag, _refresh_done_drives
+    with _refresh_lock:
+        if _refresh_done_flag:
+            _refresh_done_flag = False
+            drives = _refresh_done_drives
+            _refresh_done_drives = None
+            return drives
+        return None

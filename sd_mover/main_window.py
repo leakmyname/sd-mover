@@ -28,7 +28,8 @@ from .drive_info import DriveInfo, scan_drives
 from .transfer_worker import TransferWorker
 from .winapi import (
     format_size, get_disk_usage,
-    refresh_serial_cache, get_cached_usb_serial, get_cached_reader_serial
+    refresh_serial_cache, get_cached_usb_serial, get_cached_reader_serial,
+    pop_refresh_done
 )
 from .log_manager import LogManager
 
@@ -67,6 +68,9 @@ class MainWindow(QMainWindow):
         self._last_drive_set = None  # 用于判断是否需要刷新序列号缓存
         self._ready_to_start = set()  # 已过延迟、待全局规划的SD卡盘符
         self._serial_refreshing = False  # 后台序列号刷新中
+        self._serial_refresh_timer = QTimer()
+        self._serial_refresh_timer.timeout.connect(self._check_serial_refresh)
+        self._serial_refresh_timer.start(2000)  # 每2秒检查后台刷新是否完成
         self.config = self._load_config()
         self.log_mgr = LogManager(self._log_dir())
         self.log_mgr.increment_session()
@@ -383,9 +387,24 @@ class MainWindow(QMainWindow):
             f"{len(stats.get('drives_used', []))}个目标盘"
         )
 
-    def _on_serial_refresh_done(self):
-        """后台序列号刷新完成 — 从新缓存更新界面"""
-        self._serial_refreshing = False
+    def _check_serial_refresh(self):
+        """轮询检查后台序列号刷新是否完成(线程安全)"""
+        done_drives = pop_refresh_done()
+        if done_drives is not None:
+            self._serial_refreshing = False
+            for letter, d in self.ext_drives.items():
+                d.hw_serial = get_cached_usb_serial(letter)
+            for letter, d in self.sd_cards.items():
+                d.reader_serial = get_cached_reader_serial(letter)
+            for letter in list(self.ext_drives.keys()):
+                sn = get_cached_usb_serial(letter)
+                if sn:
+                    self._register_serial(sn, is_reader=False)
+            for letter in list(self.sd_cards.keys()):
+                sn = get_cached_reader_serial(letter)
+                if sn:
+                    self._register_serial(sn, is_reader=True)
+            self._update_ext_panel()
         for letter, d in self.ext_drives.items():
             d.hw_serial = get_cached_usb_serial(letter)
         for letter, d in self.sd_cards.items():
@@ -413,7 +432,7 @@ class MainWindow(QMainWindow):
             self._last_drive_set = drive_key
             if not self._serial_refreshing:
                 self._serial_refreshing = True
-                refresh_serial_cache(all_letters, callback=self._on_serial_refresh_done)
+                refresh_serial_cache(all_letters)
         # 从缓存填充序列号
         for d in drives:
             d.hw_serial = get_cached_usb_serial(d.letter)
@@ -942,4 +961,5 @@ class MainWindow(QMainWindow):
             w.wait(3000)
         self._poll_timer.stop()
         self._blink_timer.stop()
+        self._serial_refresh_timer.stop()
         event.accept()
