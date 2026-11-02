@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
         done_drives = pop_refresh_done()
         if done_drives is not None:
             self._serial_refreshing = False
+            self._log("序列号缓存刷新完成")
             for letter, d in self.ext_drives.items():
                 d.hw_serial = get_cached_usb_serial(letter)
             for letter, d in self.sd_cards.items():

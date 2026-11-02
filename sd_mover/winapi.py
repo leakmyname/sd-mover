@@ -247,7 +247,7 @@ def refresh_serial_cache(letters=None, callback=None):
         if callback:
             _refresh_callback = callback
         _refresh_thread = threading.Thread(
-            target=_do_refresh, args=(list(letters), callback), daemon=True
+            target=_do_refresh, args=(list(letters),), daemon=True
         )
         _refresh_thread.start()
 
