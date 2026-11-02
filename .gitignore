@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+_patch*.py
+chunks/
+exe_chunk_*
+exe1m_*
+sd_mover.b64
+sd_mover_new.exe
+sd_mover_final.exe
+*.spec
+build/
+dist/
+logs/
+sd_mover_config.json
