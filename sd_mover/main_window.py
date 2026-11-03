@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
         self.config['auto_delete'] = self.auto_delete_cb.isChecked()
         self.config['start_delay_sec'] = self.delay_spin.value()
         self.config['test_mode'] = self.test_mode_cb.isChecked()
+        self.config['overall_progress'] = self.overall_progress_cb.isChecked()
         try:
             with open(self._config_path(), 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
@@ -228,6 +229,10 @@ class MainWindow(QMainWindow):
         self.test_mode_cb = QCheckBox("测试模式(不删不弹)")
         self.test_mode_cb.setChecked(self.config.get('test_mode', False))
         s_layout.addWidget(self.test_mode_cb)
+        self.overall_progress_cb = QCheckBox("整体进度模式")
+        self.overall_progress_cb.setChecked(self.config.get('overall_progress', False))
+        self.overall_progress_cb.setToolTip("勾选: 进度条显示整张卡总进度+速度+剩余时间\n不勾选: 进度条显示当前单文件进度")
+        s_layout.addWidget(self.overall_progress_cb)
         s_layout.addStretch()
         save_btn = QPushButton("保存设置")
         save_btn.clicked.connect(self._save_config)
@@ -787,21 +792,33 @@ class MainWindow(QMainWindow):
         row = self._find_row(letter)
         if row < 0:
             return
-        # 总进度 (用于信息文本, 保留1位小数避免一直显示0%)
-        overall_1dp = (copied / total * 100) if total > 0 else 0
-        # 单文件进度 (用于进度条, 更新更频繁)
-        file_pct = int(file_copied / file_total * 100) if file_total > 0 else 0
+        # 安全 clamp: 不允许负数或超过100
+        def clamp_pct(v):
+            return max(0, min(100, v))
+        overall_raw = (copied / total * 100) if total > 0 else 0
+        overall_pct = clamp_pct(overall_raw)
+        file_raw = (file_copied / file_total * 100) if file_total > 0 else 0
+        file_pct = clamp_pct(int(file_raw))
+        use_overall = self.overall_progress_cb.isChecked()
         bar = self.sd_table.cellWidget(row, 4)
         if bar:
-            bar.setValue(file_pct)
-            bar.setFormat(f"{file_pct}%")
-        # ETA
+            if use_overall:
+                bar.setValue(overall_pct)
+                bar.setFormat(f"{overall_pct}%")
+            else:
+                bar.setValue(file_pct)
+                bar.setFormat(f"{file_pct}%")
+        # ETA (基于整卡总进度)
         eta_str = ""
         if speed > 0 and total > 0:
             remaining_bytes = total - copied
+            remaining_bytes = max(0, remaining_bytes)
             remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
             eta_str = f" | 预估: {format_eta(remaining_seconds)}"
-        info = f"总进度: {overall_1dp:.1f}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str}"
+        if use_overall:
+            info = f"{overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str}"
+        else:
+            info = f"总进度: {overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str} | 文件: {file_pct}%"
         if fname:
             info = f"{fname}\n{info}"
         self.sd_table.item(row, 5).setText(info)
