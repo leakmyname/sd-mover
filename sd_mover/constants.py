@@ -3,7 +3,7 @@
 # 硬盘识别
 MIN_EXT_DRIVE_GB = 700      # 目标硬盘最小容量(GB)
 SD_CARD_MIN_GB = 100        # SD卡容量范围下限(GB)
-SD_CARD_MAX_GB = 400        # SD卡容量范围上限(GB)
+SD_CARD_MAX_GB = 600        # SD卡容量范围上限(GB) 覆盖512GB SDXC
 
 # 传输参数
 CHUNK_SIZE = 8 * 1024 * 1024   # 8MB 分块拷贝
