@@ -39,6 +39,7 @@ class TransferWorker(QThread):
         self._last_pct10 = -1
         self._last_file_pct10 = -1
         self._start_time = 0.0
+        self._last_emit_time = 0.0
         # 等待新硬盘的同步机制
         self._space_event = threading.Event()
         self._give_up_flag = False
@@ -125,6 +126,7 @@ class TransferWorker(QThread):
             self._start_time = time.time()
             self._last_pct10 = -1
             self._last_file_pct10 = -1
+            self._last_emit_time = time.time()
             self.progress_updated.emit(letter, 0, total_size, "准备传输...", 0, 0, 0)
 
             while file_idx < len(files):
@@ -256,11 +258,14 @@ class TransferWorker(QThread):
                 fdst.write(chunk)
                 offset += len(chunk)
                 file_copied += len(chunk)
+                now = time.time()
+                elapsed = now - self._start_time
+                speed = offset / elapsed / (1024 * 1024) if elapsed > 0 else 0
                 pct10 = int(offset / total * 1000) if total else 0
-                if pct10 != self._last_pct10:
+                # Emit on 0.1% change OR every 0.5s (whichever first)
+                if pct10 != self._last_pct10 or (now - self._last_emit_time) > 0.5:
                     self._last_pct10 = pct10
-                    elapsed = time.time() - self._start_time
-                    speed = offset / elapsed / (1024 * 1024) if elapsed > 0 else 0
+                    self._last_emit_time = now
                     self.progress_updated.emit(
                         self.sd_info.letter, offset, total, fname, speed,
                         file_copied, file_size

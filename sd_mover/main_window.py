@@ -110,6 +110,7 @@ class MainWindow(QMainWindow):
         self.config['start_delay_sec'] = self.delay_spin.value()
         self.config['test_mode'] = self.test_mode_cb.isChecked()
         self.config['overall_progress'] = self.overall_progress_cb.isChecked()
+        self.config['max_concurrent'] = self.max_concurrent_spin.value()
         try:
             with open(self._config_path(), 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
@@ -233,6 +234,12 @@ class MainWindow(QMainWindow):
         self.overall_progress_cb.setChecked(self.config.get('overall_progress', False))
         self.overall_progress_cb.setToolTip("勾选: 进度条显示整张卡总进度+速度+剩余时间\n不勾选: 进度条显示当前单文件进度")
         s_layout.addWidget(self.overall_progress_cb)
+        s_layout.addWidget(QLabel("最大并发:"))
+        self.max_concurrent_spin = QSpinBox()
+        self.max_concurrent_spin.setRange(1, 50)
+        self.max_concurrent_spin.setValue(self.config.get('max_concurrent', 10))
+        self.max_concurrent_spin.setToolTip("同时传输的SD卡最大数量")
+        s_layout.addWidget(self.max_concurrent_spin)
         s_layout.addStretch()
         save_btn = QPushButton("保存设置")
         save_btn.clicked.connect(self._save_config)
@@ -569,12 +576,19 @@ class MainWindow(QMainWindow):
         )
         threshold = WARNING_THRESHOLD_GB * 1024 ** 3
         available = total_free - active_bytes - threshold
+        max_concurrent = self.max_concurrent_spin.value()
+        started = 0
         for card in ready:
+            if started >= max_concurrent:
+                self._ready_to_start.discard(card.letter)
+                self._queue_sd(card)
+                continue
             data_size = card.total - card.free
             if data_size <= available:
                 available -= data_size
                 self._ready_to_start.discard(card.letter)
                 self._start_transfer(card)
+                started += 1
             else:
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
@@ -796,29 +810,32 @@ class MainWindow(QMainWindow):
         def clamp_pct(v):
             return max(0, min(100, v))
         overall_raw = (copied / total * 100) if total > 0 else 0
-        overall_pct = clamp_pct(overall_raw)
+        overall_pct = round(clamp_pct(overall_raw), 1)
+        overall_int = int(clamp_pct(overall_raw))
         file_raw = (file_copied / file_total * 100) if file_total > 0 else 0
-        file_pct = clamp_pct(int(file_raw))
+        file_pct = round(clamp_pct(file_raw), 1)
+        file_int = int(clamp_pct(file_raw))
         use_overall = self.overall_progress_cb.isChecked()
         bar = self.sd_table.cellWidget(row, 4)
         if bar:
             if use_overall:
-                bar.setValue(overall_pct)
+                bar.setValue(overall_int)
                 bar.setFormat(f"{overall_pct}%")
             else:
-                bar.setValue(file_pct)
+                bar.setValue(file_int)
                 bar.setFormat(f"{file_pct}%")
         # ETA (基于整卡总进度)
         eta_str = ""
         if speed > 0 and total > 0:
-            remaining_bytes = total - copied
-            remaining_bytes = max(0, remaining_bytes)
+            remaining_bytes = max(0, total - copied)
             remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
             eta_str = f" | 预估: {format_eta(remaining_seconds)}"
+        # 速度显示
+        speed_str = f"{speed:.1f} MB/s" if speed > 0 else "--"
         if use_overall:
-            info = f"{overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str}"
+            info = f"{overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed_str}{eta_str}"
         else:
-            info = f"总进度: {overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed:.1f} MB/s{eta_str} | 文件: {file_pct}%"
+            info = f"总进度: {overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed_str}{eta_str}\n文件: {file_pct}% ({format_size(file_copied)}/{format_size(file_total)})"
         if fname:
             info = f"{fname}\n{info}"
         self.sd_table.item(row, 5).setText(info)
