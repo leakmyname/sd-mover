@@ -7,6 +7,8 @@ exe1m_*
 sd_mover.b64
 sd_mover_new.exe
 sd_mover_final.exe
+sd_mover_*-fix.exe
+*.bak
 *.spec
 build/
 dist/
