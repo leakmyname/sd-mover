@@ -29,3 +29,6 @@ DEFAULT_AUTO_EJECT = True
 DEFAULT_AUTO_DELETE = True
 DEFAULT_START_DELAY_SEC = 60   # SD卡插入后延迟开始(秒)
 DEFAULT_AUTO_EJECT_TEST = False  # 测试模式: 不真弹出/不真删除
+DEFAULT_MAX_CONCURRENT_SD = 10  # 同时读取SD卡数
+DEFAULT_MAX_CONCURRENT_HD = 2  # 同时写入目标硬盘数
+DEFAULT_SCATTER_MODE = True   # True=打散写入(跨盘拆分), False=整体文件(放不下跳过)

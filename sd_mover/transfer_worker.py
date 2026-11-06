@@ -13,18 +13,19 @@ from .constants import CHUNK_SIZE, SKIP_ITEMS
 
 
 class TransferWorker(QThread):
+    # letter, copied, total, fname, speed, file_copied, file_total
     progress_updated = pyqtSignal(str, int, int, str, float, int, int)
     status_changed = pyqtSignal(str, str)
     transfer_completed = pyqtSignal(str, str, str, int, int)
     transfer_failed = pyqtSignal(str, str)
     log_message = pyqtSignal(str)
     dest_changed = pyqtSignal(str, str)
-    # 盘符, 剩余文件数, 剩余字节数 — 所有盘满了, 请求UI弹窗等新盘
     need_space = pyqtSignal(str, int, int)
 
     def __init__(self, sd_info, dest_roots, ego_num, prefix,
                  auto_eject=True, auto_delete=True,
-                 reader_serial="", test_mode=False):
+                 reader_serial="", test_mode=False,
+                 scatter_mode=True):
         super().__init__()
         self.sd_info = sd_info
         self.dest_roots = dest_roots  # [(letter, path), ...]
@@ -34,13 +35,12 @@ class TransferWorker(QThread):
         self.auto_delete = auto_delete
         self.reader_serial = reader_serial
         self.test_mode = test_mode
+        self.scatter_mode = scatter_mode
         self._cancel = False
         self._lock = threading.Lock()
         self._last_pct10 = -1
-        self._last_file_pct10 = -1
         self._start_time = 0.0
         self._last_emit_time = 0.0
-        # 等待新硬盘的同步机制
         self._space_event = threading.Event()
         self._give_up_flag = False
         self._new_dests = []
@@ -49,7 +49,7 @@ class TransferWorker(QThread):
     def cancel(self):
         with self._lock:
             self._cancel = True
-        self._space_event.set()  # 唤醒可能在等待的线程
+        self._space_event.set()
 
     @property
     def is_cancelled(self):
@@ -57,13 +57,11 @@ class TransferWorker(QThread):
             return self._cancel
 
     def add_dest(self, letter, root):
-        """UI调用: 新硬盘已插入, 添加目标盘并唤醒worker"""
         with self._dest_lock:
             self._new_dests.append((letter, root))
         self._space_event.set()
 
     def give_up(self):
-        """UI调用: 用户点忽略, 放弃等待新盘"""
         self._give_up_flag = True
         self._space_event.set()
 
@@ -93,7 +91,7 @@ class TransferWorker(QThread):
             if not files:
                 self.log_message.emit(f"[{letter}] SD卡中没有数据")
                 self.status_changed.emit(letter, "无数据")
-                if self.auto_eject:
+                if self.auto_eject and not self.test_mode:
                     self._do_eject(letter)
                 self.transfer_completed.emit(letter, "", "", 0, 0)
                 return
@@ -102,12 +100,12 @@ class TransferWorker(QThread):
                 f"[{letter}] 共 {len(files)} 个文件, {format_size(total_size)}"
             )
 
-            # 按 remaining space 升序: 先填快满的盘, 像流水线
+            # Build dest list sorted by free space ascending (fill fullest first)
             all_dests = []
             for dl, dr in self.dest_roots:
                 _, free = get_disk_usage(dr)
                 all_dests.append((dl, dr, free))
-            all_dests.sort(key=lambda x: x[2])  # 最少剩余的排前面
+            all_dests.sort(key=lambda x: x[2])
             self.log_message.emit(
                 f"[{letter}] 目标盘顺序(剩余空间升序): "
                 + ", ".join(f"{dl}:{format_size(fr)}" for dl, _, fr in all_dests)
@@ -116,16 +114,14 @@ class TransferWorker(QThread):
             copied = 0
             errors = []
             file_idx = 0
-            copied_files = set()  # 已成功传输的源文件路径
+            copied_files = set()
             current_dest_letter = ""
             current_dest_path = ""
-            current_folder = None
             dest_idx = 0
 
             self.status_changed.emit(letter, "传输中")
             self._start_time = time.time()
             self._last_pct10 = -1
-            self._last_file_pct10 = -1
             self._last_emit_time = time.time()
             self.progress_updated.emit(letter, 0, total_size, "准备传输...", 0, 0, 0)
 
@@ -134,7 +130,7 @@ class TransferWorker(QThread):
                     self._cancelled(letter, copied)
                     return
 
-                # 收集新添加的目标盘 (追加到末尾, 不重新排序, 保持流水线)
+                # Collect newly added dests
                 with self._dest_lock:
                     if self._new_dests:
                         for dl, dr in self._new_dests:
@@ -145,17 +141,16 @@ class TransferWorker(QThread):
                             )
                         self._new_dests.clear()
 
-                # 找一个能放下当前文件的目标盘
                 fpath, fsize = files[file_idx]
                 chosen = None
-                # 先从当前盘往后找 (流水线顺序)
+
+                # Find a dest that can fit this file
                 for i in range(dest_idx, len(all_dests)):
                     dl, dr, _ = all_dests[i]
                     _, free = get_disk_usage(dr)
                     if free >= fsize + 1024 * 1024:
                         chosen = i
                         break
-                # 当前及后续盘都放不下, 回头检查前面的盘 (避免浪费空间)
                 if chosen is None:
                     for i in range(0, dest_idx):
                         dl, dr, _ = all_dests[i]
@@ -165,7 +160,15 @@ class TransferWorker(QThread):
                             break
 
                 if chosen is None:
-                    # 所有盘都放不下当前文件, 请求新盘
+                    if not self.scatter_mode:
+                        # Whole-file mode: skip files that don't fit anywhere
+                        self.log_message.emit(
+                            f"[{letter}] 跳过文件(无盘可容): {os.path.basename(fpath)} "
+                            f"({format_size(fsize)})"
+                        )
+                        file_idx += 1
+                        continue
+                    # Scatter mode: all dests full, request new disk
                     remainingF = len(files) - file_idx
                     remainingB = sum(f[1] for f in files[file_idx:])
                     self.status_changed.emit(letter, "等待新硬盘...")
@@ -177,20 +180,17 @@ class TransferWorker(QThread):
                     self._space_event.wait()
                     self._space_event.clear()
                     if self._give_up_flag:
-                        # 用户点忽略: 只删已传输的文件, 保留未传输的
                         self._partial_cleanup(letter, copied_files)
                         self.transfer_failed.emit(letter, "GAVE_UP")
                         return
                     if self.is_cancelled:
                         self._cancelled(letter, copied)
                         return
-                    # 新盘已添加, 继续循环重试
                     continue
 
                 dest_idx = chosen
                 dest_letter, dest_root, _ = all_dests[dest_idx]
 
-                # 换盘时创建新文件夹
                 if dest_letter != current_dest_letter:
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     folder = f"{self.prefix}{self.ego_num:02d}_{ts}"
@@ -205,7 +205,6 @@ class TransferWorker(QThread):
                         f"[{letter}] 写入 -> {dest_letter}: {dest}"
                     )
 
-                # 拷贝文件
                 rel = os.path.relpath(fpath, src_root)
                 dst_path = os.path.join(current_dest_path, rel)
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
@@ -222,12 +221,18 @@ class TransferWorker(QThread):
             self.progress_updated.emit(letter, copied, total_size, "", 0, 0, 0)
 
             all_ok = (file_idx >= len(files)) and not errors
+            skipped = total_size - copied
             if all_ok:
-                self.log_message.emit(f"[{letter}] 传输完成, 共 {format_size(copied)}")
+                if skipped > 0:
+                    self.log_message.emit(
+                        f"[{letter}] 传输完成, 已传 {format_size(copied)}, "
+                        f"跳过 {format_size(skipped)}(放不下)"
+                    )
+                else:
+                    self.log_message.emit(f"[{letter}] 传输完成, 共 {format_size(copied)}")
             elif errors:
                 self.log_message.emit(f"[{letter}] 完成, {len(errors)} 个错误")
 
-            # 只有全部文件都成功传输才清空SD卡
             if all_ok and self.auto_delete and not self.is_cancelled and not self.test_mode:
                 self.status_changed.emit(letter, "清空SD卡...")
                 self._clear_sd(src_root, letter)
@@ -262,7 +267,6 @@ class TransferWorker(QThread):
                 elapsed = now - self._start_time
                 speed = offset / elapsed / (1024 * 1024) if elapsed > 0 else 0
                 pct10 = int(offset / total * 1000) if total else 0
-                # Emit on 0.1% change OR every 0.5s (whichever first)
                 if pct10 != self._last_pct10 or (now - self._last_emit_time) > 0.5:
                     self._last_pct10 = pct10
                     self._last_emit_time = now
@@ -277,7 +281,6 @@ class TransferWorker(QThread):
         return offset
 
     def _partial_cleanup(self, letter, copied_files):
-        """只删除已成功传输的文件, 保留未传输的"""
         self.status_changed.emit(letter, "清理已传输文件...")
         count = 0
         for fpath in copied_files:
@@ -288,7 +291,6 @@ class TransferWorker(QThread):
                 count += 1
             except Exception:
                 pass
-        # 删除空目录
         for dirpath, dirnames, filenames in os.walk(self.sd_info.root, topdown=False):
             if self.is_cancelled:
                 break
