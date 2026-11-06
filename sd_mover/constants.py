@@ -1,8 +1,8 @@
 """应用常量配置"""
 
 # 硬盘识别
-MIN_EXT_DRIVE_GB = 700      # 目标硬盘最小容量(GB)
-SD_CARD_MIN_GB = 100        # SD卡容量范围下限(GB)
+MIN_EXT_DRIVE_GB = 700    # 目标硬盘最小容量(GB)
+SD_CARD_MIN_GB = 1        # SD卡容量范围下限(GB)
 SD_CARD_MAX_GB = 600        # SD卡容量范围上限(GB) 覆盖512GB SDXC
 
 # 传输参数
@@ -27,7 +27,7 @@ SKIP_ITEMS = {
 DEFAULT_PREFIX = 'ego'
 DEFAULT_AUTO_EJECT = True
 DEFAULT_AUTO_DELETE = True
-DEFAULT_START_DELAY_SEC = 60   # SD卡插入后延迟开始(秒)
+DEFAULT_START_DELAY_SEC = 2   # SD卡插入后延迟开始(秒)
 DEFAULT_AUTO_EJECT_TEST = False  # 测试模式: 不真弹出/不真删除
 DEFAULT_MAX_CONCURRENT_SD = 10  # 同时读取SD卡数
 DEFAULT_MAX_CONCURRENT_HD = 2  # 同时写入目标硬盘数

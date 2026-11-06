@@ -50,7 +50,7 @@ class LogManager:
                 if len(parts) < 7:
                     continue
                 date_str = parts[0].strip()[:10]
-                size_str = parts[5].strip()
+                size_str = parts[4].strip()
                 status = parts[6].strip()
                 if '完成' not in status:
                     continue

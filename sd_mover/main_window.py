@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         self.delay_remaining = {}
         self.delay_tick = {}
         self._last_drive_set = None
+        self._test_processed = set()  # SD cards already transferred in test mode
         self._ready_to_start = set()
         self._serial_refreshing = False
         self._serial_refresh_timer = QTimer()
@@ -98,7 +99,7 @@ class MainWindow(QMainWindow):
 
     def _load_config(self):
         try:
-            with open(self._config_path(), 'r', encoding='utf-8') as f:
+            with open(self._config_path(), 'r', encoding='utf-8-sig') as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -235,7 +236,7 @@ class MainWindow(QMainWindow):
 
         basic_layout.addWidget(QLabel("最小硬盘(GB):"), 0, 2)
         self.min_size_spin = QSpinBox()
-        self.min_size_spin.setRange(100, 10000)
+        self.min_size_spin.setRange(1, 10000)
         self.min_size_spin.setValue(self.config.get('min_ext_gb', 700))
         basic_layout.addWidget(self.min_size_spin, 0, 3)
 
@@ -501,7 +502,8 @@ class MainWindow(QMainWindow):
 
     def _poll_drives(self):
         try:
-            drives = scan_drives()
+            min_gb = self.min_size_spin.value()
+            drives = scan_drives(min_ext_gb=min_gb)
         except Exception as e:
             self._log(f"扫描驱动器失败: {e}")
             return
@@ -576,6 +578,9 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
 
     def _start_with_delay(self, d):
+        if self.test_mode_cb.isChecked() and d.letter in self._test_processed:
+            self._update_sd_status(d.letter, "已传(测试)")
+            return
         delay = self.delay_spin.value()
         if delay <= 0:
             self._check_and_start(d)
@@ -634,8 +639,7 @@ class MainWindow(QMainWindow):
             (w.sd_info.total - w.sd_info.free)
             for w in self.workers.values()
         )
-        threshold = self.warn_spin.value() * 1024 ** 3
-        available = total_free - active_bytes - threshold
+        available = max(0, total_free - active_bytes)
         max_sd = self.max_concurrent_sd_spin.value()
         started = len(self.processing)
         for card in ready:
@@ -877,20 +881,19 @@ class MainWindow(QMainWindow):
         def clamp_pct(v):
             return max(0, min(100, v))
         overall_raw = (copied / total * 100) if total > 0 else 0
-        overall_pct = round(clamp_pct(overall_raw), 1)
         overall_int = int(clamp_pct(overall_raw))
         bar = self.sd_table.cellWidget(row, 4)
         if bar:
             bar.setValue(overall_int)
-            bar.setFormat(f"{overall_pct}%")
-        # ETA based on overall progress
+            bar.setFormat(f"{overall_int}%")
+        # ETA + speed (always show, even if 0)
         eta_str = ""
-        if speed > 0 and total > 0:
+        if total > 0 and speed > 0:
             remaining_bytes = max(0, total - copied)
             remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
             eta_str = f" | 剩余: {format_eta(remaining_seconds)}"
-        speed_str = f"{speed:.1f} MB/s" if speed > 0 else "--"
-        info = f"{overall_pct}% | {format_size(copied)}/{format_size(total)} | {speed_str}{eta_str}"
+        speed_str = f"{speed:.1f} MB/s"
+        info = f"{overall_int}% | {format_size(copied)}/{format_size(total)} | {speed_str}{eta_str}"
         if fname:
             info = f"{fname}\n{info}"
         self.sd_table.item(row, 5).setText(info)
@@ -898,6 +901,8 @@ class MainWindow(QMainWindow):
     def _on_completed(self, letter, dest_letter, dest_path, bytes_tx, file_count):
         self.session_transferred += bytes_tx
         self.session_sd_count += 1
+        if self.test_mode_cb.isChecked():
+            self._test_processed.add(letter)
         self._log(f"[{letter}] [OK] 传输完成: {format_size(bytes_tx)} -> {dest_letter}: {dest_path}")
         row = self._find_row(letter)
         if row >= 0:
@@ -964,6 +969,7 @@ class MainWindow(QMainWindow):
             if d:
                 self.waiting_set.discard(letter)
                 self.pending_queue = [s for s in self.pending_queue if s.letter != letter]
+                self._test_processed.discard(letter)
                 self._check_and_start(d)
                 self._log(f"[{letter}] 重新开始传输")
 
@@ -1015,6 +1021,7 @@ class MainWindow(QMainWindow):
         item.setText(status)
         colors = {
             "已完成": QColor(0, 128, 0),
+            "已传(测试)": QColor(0, 128, 0),
             "失败": QColor(255, 0, 0),
             "空间不足": QColor(255, 0, 0),
             "传输中": QColor(0, 0, 200),

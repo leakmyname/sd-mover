@@ -103,13 +103,17 @@ class TransferWorker(QThread):
             # Build dest list sorted by free space ascending (fill fullest first)
             all_dests = []
             for dl, dr in self.dest_roots:
-                _, free = get_disk_usage(dr)
-                all_dests.append((dl, dr, free))
+                try:
+                    _, free = get_disk_usage(dr)
+                    all_dests.append((dl, dr, free))
+                except Exception:
+                    pass
             all_dests.sort(key=lambda x: x[2])
-            self.log_message.emit(
-                f"[{letter}] 目标盘顺序(剩余空间升序): "
-                + ", ".join(f"{dl}:{format_size(fr)}" for dl, _, fr in all_dests)
-            )
+            if all_dests:
+                self.log_message.emit(
+                    f"[{letter}] 目标盘: "
+                    + ", ".join(f"{dl}:{format_size(fr)}" for dl, _, fr in all_dests)
+                )
 
             copied = 0
             errors = []
