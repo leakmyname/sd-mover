@@ -14,13 +14,13 @@ from .constants import CHUNK_SIZE, SKIP_ITEMS
 
 class TransferWorker(QThread):
     # letter, copied, total, fname, speed, file_copied, file_total
-    progress_updated = pyqtSignal(str, int, int, str, float, int, int)
+    progress_updated = pyqtSignal(str, float, float, str, float, float, float)
     status_changed = pyqtSignal(str, str)
-    transfer_completed = pyqtSignal(str, str, str, int, int)
+    transfer_completed = pyqtSignal(str, str, str, float, int)
     transfer_failed = pyqtSignal(str, str)
     log_message = pyqtSignal(str)
     dest_changed = pyqtSignal(str, str)
-    need_space = pyqtSignal(str, int, int)
+    need_space = pyqtSignal(str, int, float)
 
     def __init__(self, sd_info, dest_roots, ego_num, prefix,
                  auto_eject=True, auto_delete=True,

@@ -184,18 +184,19 @@ class MainWindow(QMainWindow):
         # SD卡列表
         sd_group = QGroupBox("SD卡列表")
         sd_layout = QVBoxLayout(sd_group)
-        self.sd_table = QTableWidget(0, 7)
-        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","信息","操作"])
+        self.sd_table = QTableWidget(0, 8)
+        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","操作"])
         h = self.sd_table.horizontalHeader()
-        h.setSectionResizeMode(5, QHeaderView.Stretch)
+        h.setSectionResizeMode(6, QHeaderView.Stretch)
         h.setSectionResizeMode(4, QHeaderView.Fixed)
-        h.setSectionResizeMode(6, QHeaderView.Fixed)
+        h.setSectionResizeMode(7, QHeaderView.Fixed)
         self.sd_table.setColumnWidth(0, 50)
         self.sd_table.setColumnWidth(1, 80)
         self.sd_table.setColumnWidth(2, 80)
         self.sd_table.setColumnWidth(3, 80)
         self.sd_table.setColumnWidth(4, 180)
-        self.sd_table.setColumnWidth(6, 80)
+        self.sd_table.setColumnWidth(5, 90)
+        self.sd_table.setColumnWidth(7, 80)
         self.sd_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sd_table.setSelectionMode(QAbstractItemView.NoSelection)
         sd_layout.addWidget(self.sd_table)
@@ -517,14 +518,14 @@ class MainWindow(QMainWindow):
         ext_new = {}
         sd_new = {}
         for d in drives:
-            if d.is_external_drive:
-                sn = get_cached_usb_serial(d.letter) or ""
-                d.hw_serial = sn
-                ext_new[d.letter] = d
-            elif d.is_sd_card:
+            if d.is_sd_card:
                 sn = get_cached_reader_serial(d.letter) or ""
                 d.reader_serial = sn
                 sd_new[d.letter] = d
+            elif d.is_external_drive:
+                sn = get_cached_usb_serial(d.letter) or ""
+                d.hw_serial = sn
+                ext_new[d.letter] = d
         old_ext = set(self.ext_drives.keys())
         old_sd = set(self.sd_cards.keys())
         self.ext_drives = ext_new
@@ -809,7 +810,8 @@ class MainWindow(QMainWindow):
     def _on_dest_changed(self, letter, dest_letter):
         row = self._find_row(letter)
         if row >= 0:
-            self.sd_table.item(row, 5).setText(f"写入 -> {dest_letter}:")
+            # 速度列(5)和剩余时间列(6)会被进度更新覆盖, 这里不改
+            pass
 
     def _on_need_space(self, letter, remaining_files, remaining_bytes):
         worker = self.workers.get(letter)
@@ -886,17 +888,24 @@ class MainWindow(QMainWindow):
         if bar:
             bar.setValue(overall_int)
             bar.setFormat(f"{overall_int}%")
-        # ETA + speed (always show, even if 0)
-        eta_str = ""
-        if total > 0 and speed > 0:
-            remaining_bytes = max(0, total - copied)
-            remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
-            eta_str = f" | 剩余: {format_eta(remaining_seconds)}"
-        speed_str = f"{speed:.1f} MB/s"
-        info = f"{overall_int}% | {format_size(copied)}/{format_size(total)} | {speed_str}{eta_str}"
-        if fname:
-            info = f"{fname}\n{info}"
-        self.sd_table.item(row, 5).setText(info)
+        # 速度列(5) - 始终显示
+        speed_item = self.sd_table.item(row, 5)
+        if speed_item:
+            if speed > 0:
+                speed_item.setText(f"{speed:.1f} MB/s")
+            else:
+                speed_item.setText("0.0 MB/s")
+        # 剩余时间列(6) - 始终显示
+        eta_item = self.sd_table.item(row, 6)
+        if eta_item:
+            if total > 0 and speed > 0:
+                remaining_bytes = max(0, total - copied)
+                remaining_seconds = remaining_bytes / (speed * 1024 * 1024)
+                eta_item.setText(format_eta(remaining_seconds))
+            elif total > 0 and copied > 0:
+                eta_item.setText("计算中")
+            else:
+                eta_item.setText("--")
 
     def _on_completed(self, letter, dest_letter, dest_path, bytes_tx, file_count):
         self.session_transferred += bytes_tx
@@ -910,6 +919,12 @@ class MainWindow(QMainWindow):
             if bar:
                 bar.setValue(100)
                 bar.setFormat("100%")
+            speed_item = self.sd_table.item(row, 5)
+            if speed_item:
+                speed_item.setText("--")
+            eta_item = self.sd_table.item(row, 6)
+            if eta_item:
+                eta_item.setText("已完成")
             self._update_sd_status(letter, "已完成")
         sd = self.sd_cards.get(letter)
         sd_label = sd.label if sd else ""
@@ -955,7 +970,7 @@ class MainWindow(QMainWindow):
         btn_text = ""
         row = self._find_row(letter)
         if row >= 0:
-            btn = self.sd_table.cellWidget(row, 6)
+            btn = self.sd_table.cellWidget(row, 7)
             if btn:
                 btn_text = btn.text()
         if btn_text == "取消":
@@ -985,16 +1000,17 @@ class MainWindow(QMainWindow):
         bar.setValue(0)
         bar.setFormat("0%")
         self.sd_table.setCellWidget(row, 4, bar)
-        self.sd_table.setItem(row, 5, QTableWidgetItem(""))
+        self.sd_table.setItem(row, 5, QTableWidgetItem("--"))
+        self.sd_table.setItem(row, 6, QTableWidgetItem("--"))
         btn = QPushButton("取消")
         btn.setEnabled(False)
         btn.clicked.connect(lambda checked, l=d.letter: self._on_action_btn(l))
-        self.sd_table.setCellWidget(row, 6, btn)
+        self.sd_table.setCellWidget(row, 7, btn)
 
     def _set_sd_button(self, letter, text):
         row = self._find_row(letter)
         if row >= 0:
-            btn = self.sd_table.cellWidget(row, 6)
+            btn = self.sd_table.cellWidget(row, 7)
             if btn:
                 btn.setText(text)
                 btn.setEnabled(True)
