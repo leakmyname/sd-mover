@@ -1,4 +1,4 @@
-"""文件传输工作线程 - 多硬盘流水线: 先填满快满的盘, 满了等新盘"""
+"""文件传输工作线程 - 每张SD卡绑定主目标盘, 写满才换下一块"""
 
 import os
 import time
@@ -25,7 +25,7 @@ class TransferWorker(QThread):
     def __init__(self, sd_info, dest_roots, ego_num, prefix,
                 auto_eject=True, auto_delete=True,
                 reader_serial="", test_mode=False,
-                scatter_mode=True):
+                scatter_mode=True, primary_dest=""):
         super().__init__()
         self.sd_info = sd_info
         self.dest_roots = dest_roots  # [(letter, path), ...]
@@ -36,6 +36,7 @@ class TransferWorker(QThread):
         self.reader_serial = reader_serial
         self.test_mode = test_mode
         self.scatter_mode = scatter_mode
+        self.primary_dest = primary_dest  # 主绑定盘符(空则自动选)
         self._cancel = False
         self._lock = threading.Lock()
         self._last_pct10 = -1
@@ -101,7 +102,8 @@ class TransferWorker(QThread):
                 f"[{letter}] 共 {len(files)} 个文件, {format_size(total_size)}"
             )
 
-            # Build dest list sorted by free space ascending (fill fullest first)
+            # Build dest list; primary_dest first (bind SD card to one drive),
+            # then others by free space descending as fallback
             all_dests = []
             for dl, dr in self.dest_roots:
                 try:
@@ -109,12 +111,16 @@ class TransferWorker(QThread):
                     all_dests.append((dl, dr, free))
                 except Exception:
                     pass
-            # Sort by free space DESCENDING (most free first)
-            # This distributes files across drives instead of filling one at a time
-            all_dests.sort(key=lambda x: x[2], reverse=True)
+            # Primary dest goes first so this SD card writes to its bound drive
+            # until full, then falls back to others
+            if self.primary_dest:
+                all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+            else:
+                all_dests.sort(key=lambda x: x[2], reverse=True)
             if all_dests:
+                pdesc = f" (绑定 {self.primary_dest})" if self.primary_dest else ""
                 self.log_message.emit(
-                    f"[{letter}] 目标盘: "
+                    f"[{letter}] 目标盘{pdesc}: "
                     + ", ".join(f"{dl}:{format_size(fr)}" for dl, _, fr in all_dests)
                 )
 
@@ -137,7 +143,7 @@ class TransferWorker(QThread):
                     self._cancelled(letter, copied)
                     return
 
-                # Collect newly added dests
+                # Collect newly added dests and re-sort so primary_dest leads
                 with self._dest_lock:
                     if self._new_dests:
                         for dl, dr in self._new_dests:
@@ -147,19 +153,25 @@ class TransferWorker(QThread):
                                 f"[{self.sd_info.letter}] 新增目标盘 {dl}: (剩余 {format_size(free)})"
                             )
                         self._new_dests.clear()
+                        # Re-sort: primary_dest first, then by free desc
+                        if self.primary_dest:
+                            all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+                        else:
+                            all_dests.sort(key=lambda x: x[2], reverse=True)
 
                 fpath, fsize = files[file_idx]
                 chosen = None
 
-                # Find the dest with MOST free space that can fit this file
-                # This distributes files across multiple drives naturally
-                best_free = -1
+                # Stick to primary dest first; only switch when it cannot fit
+                # this file. This makes each SD card fill one drive before
+                # moving to the next, while different SD cards bind different
+                # drives for true parallel writes.
                 for i in range(len(all_dests)):
                     dl, dr, _ = all_dests[i]
                     _, free = get_disk_usage(dr)
-                    if free >= fsize + 1024 * 1024 and free > best_free:
+                    if free >= fsize + 1024 * 1024:
                         chosen = i
-                        best_free = free
+                        break
 
                 if chosen is None:
                     if not self.scatter_mode:

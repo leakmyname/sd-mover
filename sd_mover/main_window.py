@@ -785,19 +785,32 @@ class MainWindow(QMainWindow):
         self.processing.add(d.letter)
         ego = self._next_ego()
         prefix = self.prefix_edit.text() or DEFAULT_PREFIX
-        dest_roots = []
+        # Build full dest list (all external drives), sorted by free desc
+        all_dests_full = []
         for letter in sorted(self.ext_drives.keys()):
             dr = self.ext_drives[letter]
             _, free = get_disk_usage(dr.root)
-            dest_roots.append((letter, dr.root, free))
-        # Limit dest drives to max_concurrent_hd
+            all_dests_full.append((letter, dr.root, free))
+        all_dests_full.sort(key=lambda x: x[2], reverse=True)
+        # Limit to max_concurrent_hd drives (most free first)
         max_hd = self.max_concurrent_hd_spin.value()
-        # Sort by free space DESCENDING (most free first)
-        # When max_concurrent_hd limits the list, picks drives with most space
-        dest_roots.sort(key=lambda x: x[2], reverse=True)
-        if len(dest_roots) > max_hd:
-            dest_roots = dest_roots[:max_hd]
-        dest_roots = [(l, r) for l, r, _ in dest_roots]
+        active_roots = all_dests_full[:max_hd]
+        # Bind this SD card to a PRIMARY dest so it fills one drive before
+        # switching. Round-robin among the active drives so multiple SD cards
+        # bind different drives for true parallel writes.
+        primary_dest = ""
+        if active_roots:
+            # Count how many workers are already bound to each drive
+            bind_count = {}
+            for l, r, _ in active_roots:
+                bind_count[l] = 0
+            for w in self.workers.values():
+                if w.primary_dest in bind_count:
+                    bind_count[w.primary_dest] += 1
+            # Pick the active drive with the fewest bindings (ties broken by most free)
+            best = min(active_roots, key=lambda x: (bind_count[x[0]], -x[2]))
+            primary_dest = best[0]
+        dest_roots = [(l, r) for l, r, _ in active_roots]
         scatter = self.scatter_radio.isChecked()
         worker = TransferWorker(
             sd_info=d, dest_roots=dest_roots,
@@ -806,7 +819,8 @@ class MainWindow(QMainWindow):
             auto_delete=self.auto_delete_cb.isChecked(),
             reader_serial=d.reader_serial or "",
             test_mode=self.test_mode_cb.isChecked(),
-            scatter_mode=scatter
+            scatter_mode=scatter,
+            primary_dest=primary_dest
         )
         worker.progress_updated.connect(self._on_progress)
         worker.status_changed.connect(self._update_sd_status)
@@ -817,7 +831,8 @@ class MainWindow(QMainWindow):
         worker.need_space.connect(self._on_need_space)
         self.workers[d.letter] = worker
         worker.start()
-        self._log(f"[{d.letter}] 分配编号: {prefix}{ego:02d} (模式: {'打散' if scatter else '整体文件'})")
+        mode_str = '打散' if scatter else '整体文件'
+        self._log(f"[{d.letter}] 分配编号: {prefix}{ego:02d} (模式: {mode_str}, 主盘: {primary_dest or '自动'})")
         self._set_sd_button(d.letter, "取消")
 
     def _on_dest_changed(self, letter, dest_letter):
@@ -879,9 +894,11 @@ class MainWindow(QMainWindow):
             new_dests.sort(key=lambda x: get_disk_usage(x[1])[1])
             for dl, dr in new_dests[:max_hd]:
                 worker.add_dest(dl, dr)
+                # Update primary_dest so worker binds the newly added drive
+                worker.primary_dest = dl
                 existing.add(dl)
                 added += 1
-                self._log(f"[{letter}] 新增目标盘 {dl}:")
+                self._log(f"[{letter}] 新增目标盘 {dl}: (绑定)")
             if added == 0:
                 QMessageBox.information(
                     self, "未检测到新硬盘",
