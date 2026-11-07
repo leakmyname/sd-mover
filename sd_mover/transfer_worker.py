@@ -23,9 +23,9 @@ class TransferWorker(QThread):
     need_space = pyqtSignal(str, int, float)
 
     def __init__(self, sd_info, dest_roots, ego_num, prefix,
-                 auto_eject=True, auto_delete=True,
-                 reader_serial="", test_mode=False,
-                 scatter_mode=True):
+                auto_eject=True, auto_delete=True,
+                reader_serial="", test_mode=False,
+                scatter_mode=True):
         super().__init__()
         self.sd_info = sd_info
         self.dest_roots = dest_roots  # [(letter, path), ...]
@@ -45,6 +45,7 @@ class TransferWorker(QThread):
         self._give_up_flag = False
         self._new_dests = []
         self._dest_lock = threading.Lock()
+        self._folder_name = ""  # consistent folder name per SD card
 
     def cancel(self):
         with self._lock:
@@ -108,7 +109,9 @@ class TransferWorker(QThread):
                     all_dests.append((dl, dr, free))
                 except Exception:
                     pass
-            all_dests.sort(key=lambda x: x[2])
+            # Sort by free space DESCENDING (most free first)
+            # This distributes files across drives instead of filling one at a time
+            all_dests.sort(key=lambda x: x[2], reverse=True)
             if all_dests:
                 self.log_message.emit(
                     f"[{letter}] 目标盘: "
@@ -148,20 +151,15 @@ class TransferWorker(QThread):
                 fpath, fsize = files[file_idx]
                 chosen = None
 
-                # Find a dest that can fit this file
-                for i in range(dest_idx, len(all_dests)):
+                # Find the dest with MOST free space that can fit this file
+                # This distributes files across multiple drives naturally
+                best_free = -1
+                for i in range(len(all_dests)):
                     dl, dr, _ = all_dests[i]
                     _, free = get_disk_usage(dr)
-                    if free >= fsize + 1024 * 1024:
+                    if free >= fsize + 1024 * 1024 and free > best_free:
                         chosen = i
-                        break
-                if chosen is None:
-                    for i in range(0, dest_idx):
-                        dl, dr, _ = all_dests[i]
-                        _, free = get_disk_usage(dr)
-                        if free >= fsize + 1024 * 1024:
-                            chosen = i
-                            break
+                        best_free = free
 
                 if chosen is None:
                     if not self.scatter_mode:
@@ -195,12 +193,14 @@ class TransferWorker(QThread):
                 dest_idx = chosen
                 dest_letter, dest_root, _ = all_dests[dest_idx]
 
-                if dest_letter != current_dest_letter:
+                # Use consistent folder name per SD card across all dest drives
+                # so files from same SD card are easy to find
+                if not hasattr(self, '_folder_name') or not self._folder_name:
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    folder = f"{self.prefix}{self.ego_num:02d}_{ts}"
+                    self._folder_name = f"{self.prefix}{self.ego_num:02d}_{ts}"
+                if dest_letter != current_dest_letter:
+                    folder = self._folder_name
                     dest = os.path.join(dest_root, folder)
-                    if os.path.exists(dest):
-                        dest = os.path.join(dest_root, f"{folder}_{int(time.time())}")
                     os.makedirs(dest, exist_ok=True)
                     current_dest_letter = dest_letter
                     current_dest_path = dest
@@ -224,29 +224,38 @@ class TransferWorker(QThread):
 
             self.progress_updated.emit(letter, copied, total_size, "", 0, 0, 0)
 
-            all_ok = (file_idx >= len(files)) and not errors
             skipped = total_size - copied
+            # all_ok: 所有文件都传输成功, 没有跳过, 没有错误
+            # 如果整体文件模式下有跳过(skipped>0), 不能清空SD卡(有文件没传过去)
+            all_ok = (file_idx >= len(files)) and not errors and skipped == 0
+            # partial_ok: 传完了但有些文件跳过/放不下, 不删除SD卡
+            partial_ok = (file_idx >= len(files)) and not errors and skipped > 0
             if all_ok:
-                if skipped > 0:
-                    self.log_message.emit(
-                        f"[{letter}] 传输完成, 已传 {format_size(copied)}, "
-                        f"跳过 {format_size(skipped)}(放不下)"
-                    )
-                else:
-                    self.log_message.emit(f"[{letter}] 传输完成, 共 {format_size(copied)}")
+                self.log_message.emit(f"[{letter}] 传输完成, 共 {format_size(copied)}")
+            elif partial_ok:
+                self.log_message.emit(
+                    f"[{letter}] 传输完成, 已传 {format_size(copied)}, "
+                    f"跳过 {format_size(skipped)}(放不下), 未删除SD卡"
+                )
             elif errors:
                 self.log_message.emit(f"[{letter}] 完成, {len(errors)} 个错误")
 
+            # 只有all_ok才清空SD卡; partial_ok不删除(有文件没传)
             if all_ok and self.auto_delete and not self.is_cancelled and not self.test_mode:
                 self.status_changed.emit(letter, "清空SD卡...")
                 self._clear_sd(src_root, letter)
             elif all_ok and self.test_mode:
                 self.log_message.emit(f"[{letter}] 测试模式: 跳过删除SD卡文件")
+            elif partial_ok:
+                self.log_message.emit(f"[{letter}] 有跳过文件, 保留SD卡数据")
 
-            if self.auto_eject and not self.is_cancelled and not self.test_mode:
+            # all_ok才弹出; partial_ok不弹出(保留数据让用户处理)
+            if all_ok and self.auto_eject and not self.is_cancelled and not self.test_mode:
                 self._do_eject(letter)
-            elif self.test_mode:
+            elif all_ok and self.test_mode:
                 self.log_message.emit(f"[{letter}] 测试模式: 跳过弹出SD卡")
+            elif partial_ok:
+                self.log_message.emit(f"[{letter}] 有跳过文件, 不弹出SD卡")
 
             self.transfer_completed.emit(
                 letter, current_dest_letter, current_dest_path, copied, len(files)

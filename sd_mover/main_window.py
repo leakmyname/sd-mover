@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         self.delay_tick = {}
         self._last_drive_set = None
         self._test_processed = set()  # SD cards already transferred in test mode
+        self._completed_sd = set()  # SD letters already completed (avoid auto-restart loop)
         self._ready_to_start = set()
         self._serial_refreshing = False
         self._serial_refresh_timer = QTimer()
@@ -547,6 +548,7 @@ class MainWindow(QMainWindow):
             self._cancel_delay(letter)
             self.pending_queue = [s for s in self.pending_queue if s.letter != letter]
             self._remove_sd_row(letter)
+            self._completed_sd.discard(letter)
         for letter in old_ext - set(ext_new.keys()):
             self._log(f"目标硬盘 {letter}: 已移除")
         self._update_ext_panel()
@@ -554,6 +556,8 @@ class MainWindow(QMainWindow):
             if letter not in old_sd:
                 d = sd_new[letter]
                 self._add_sd_row(d)
+                # New SD card inserted: clear completed state
+                self._completed_sd.discard(letter)
                 if d.letter not in self.processing and d.letter not in self.waiting_set:
                     if d.letter not in self._ready_to_start:
                         self._start_with_delay(d)
@@ -571,6 +575,9 @@ class MainWindow(QMainWindow):
             if letter in self._ready_to_start:
                 continue
             if letter in self.delay_remaining:
+                continue
+            # Skip SD cards that already completed transfer (avoid auto-restart loop)
+            if letter in self._completed_sd:
                 continue
             _, sd_free = get_disk_usage(d.root)
             d.free = sd_free
@@ -643,14 +650,18 @@ class MainWindow(QMainWindow):
         available = max(0, total_free - active_bytes)
         max_sd = self.max_concurrent_sd_spin.value()
         started = len(self.processing)
+        # 整体文件模式: 不做空间预算, 允许启动(worker内部跳过放不下的文件)
+        # 打散模式: 需要空间预算, 不够则排队等待新盘
+        whole_mode = self.whole_radio.isChecked()
         for card in ready:
             if started >= max_sd:
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
                 continue
             data_size = card.total - card.free
-            if data_size <= available:
-                available -= data_size
+            if whole_mode or data_size <= available:
+                if not whole_mode:
+                    available -= data_size
                 self._ready_to_start.discard(card.letter)
                 self._start_transfer(card)
                 started += 1
@@ -781,7 +792,9 @@ class MainWindow(QMainWindow):
             dest_roots.append((letter, dr.root, free))
         # Limit dest drives to max_concurrent_hd
         max_hd = self.max_concurrent_hd_spin.value()
-        dest_roots.sort(key=lambda x: x[2])  # fill fullest first
+        # Sort by free space DESCENDING (most free first)
+        # When max_concurrent_hd limits the list, picks drives with most space
+        dest_roots.sort(key=lambda x: x[2], reverse=True)
         if len(dest_roots) > max_hd:
             dest_roots = dest_roots[:max_hd]
         dest_roots = [(l, r) for l, r, _ in dest_roots]
@@ -912,6 +925,8 @@ class MainWindow(QMainWindow):
         self.session_sd_count += 1
         if self.test_mode_cb.isChecked():
             self._test_processed.add(letter)
+        # Mark as completed so auto-poll won't restart it (prevents delete loop)
+        self._completed_sd.add(letter)
         self._log(f"[{letter}] [OK] 传输完成: {format_size(bytes_tx)} -> {dest_letter}: {dest_path}")
         row = self._find_row(letter)
         if row >= 0:
@@ -948,6 +963,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._try_start_queued)
 
     def _on_failed(self, letter, error):
+        # Mark completed to prevent auto-restart loop (user can manually restart)
+        self._completed_sd.add(letter)
         if error == "CANCELLED":
             self._update_sd_status(letter, "已取消")
             self._log(f"[{letter}] 传输已取消")
@@ -985,6 +1002,7 @@ class MainWindow(QMainWindow):
                 self.waiting_set.discard(letter)
                 self.pending_queue = [s for s in self.pending_queue if s.letter != letter]
                 self._test_processed.discard(letter)
+                self._completed_sd.discard(letter)
                 self._check_and_start(d)
                 self._log(f"[{letter}] 重新开始传输")
 
