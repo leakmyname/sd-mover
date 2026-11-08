@@ -162,23 +162,41 @@ class TransferWorker(QThread):
                 fpath, fsize = files[file_idx]
                 chosen = None
 
-                # Stick to primary dest first; only switch when it cannot fit
-                # this file. This makes each SD card fill one drive before
-                # moving to the next, while different SD cards bind different
-                # drives for true parallel writes.
-                for i in range(len(all_dests)):
-                    dl, dr, _ = all_dests[i]
-                    _, free = get_disk_usage(dr)
-                    if free >= fsize + 1024 * 1024:
-                        chosen = i
+                # ── 选盘逻辑 ──
+                # 整体文件模式: 只用主盘(primary_dest), 放不下就跳过
+                # 打散模式: 先写主盘, 满了溢出到其他盘
+                if not self.scatter_mode and self.primary_dest:
+                    # 整体文件: 只检查主盘
+                    for i in range(len(all_dests)):
+                        dl, dr, _ = all_dests[i]
+                        if dl != self.primary_dest:
+                            continue
+                        _, free = get_disk_usage(dr)
+                        if free >= fsize + 1024 * 1024:
+                            chosen = i
                         break
+                else:
+                    # 打散: 先主盘, 满了再其他盘
+                    for i in range(len(all_dests)):
+                        dl, dr, _ = all_dests[i]
+                        _, free = get_disk_usage(dr)
+                        if free >= fsize + 1024 * 1024:
+                            chosen = i
+                            break
 
                 if chosen is None:
                     if not self.scatter_mode:
-                        # Whole-file mode: skip files that don't fit anywhere
+                        # 整体文件模式: 主盘放不下, 跳过此文件
+                        pfree_str = "未知"
+                        for dl, dr, _ in all_dests:
+                            if dl == self.primary_dest:
+                                _, pf = get_disk_usage(dr)
+                                pfree_str = format_size(pf)
+                                break
                         self.log_message.emit(
-                            f"[{letter}] 跳过文件(无盘可容): {os.path.basename(fpath)} "
-                            f"({format_size(fsize)})"
+                            f"[{letter}] 跳过(主盘{self.primary_dest}放不下): "
+                            f"{os.path.basename(fpath)} ({format_size(fsize)}, "
+                            f"主盘剩余{pfree_str})"
                         )
                         file_idx += 1
                         continue

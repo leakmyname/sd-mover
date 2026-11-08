@@ -795,6 +795,7 @@ class MainWindow(QMainWindow):
         # Limit to max_concurrent_hd drives (most free first)
         max_hd = self.max_concurrent_hd_spin.value()
         active_roots = all_dests_full[:max_hd]
+        scatter = self.scatter_radio.isChecked()
         # Bind this SD card to a PRIMARY dest so it fills one drive before
         # switching. Round-robin among the active drives so multiple SD cards
         # bind different drives for true parallel writes.
@@ -807,11 +808,25 @@ class MainWindow(QMainWindow):
             for w in self.workers.values():
                 if w.primary_dest in bind_count:
                     bind_count[w.primary_dest] += 1
-            # Pick the active drive with the fewest bindings (ties broken by most free)
-            best = min(active_roots, key=lambda x: (bind_count[x[0]], -x[2]))
+            # Pick the active drive with the fewest bindings
+            # Prefer drives that can actually hold this SD card's data
+            data_size = d.total - d.free
+            best = min(active_roots, key=lambda x: (
+                0 if x[2] >= data_size else 1,  # prefer drives that can hold all data
+                bind_count[x[0]],                # then fewest bindings
+                -x[2]                            # then most free space
+            ))
             primary_dest = best[0]
+            # Warn if primary dest can't hold all the SD card's data
+            for l, r, free in active_roots:
+                if l == primary_dest and free < data_size:
+                    mode_hint = "将跳过放不下的文件" if not scatter else "写满后溢出到其他盘"
+                    self._log(
+                        f"[{d.letter}] 警告: 主盘{primary_dest}剩余{format_size(free)}, "
+                        f"SD卡数据{format_size(data_size)}, {mode_hint}"
+                    )
+                    break
         dest_roots = [(l, r) for l, r, _ in active_roots]
-        scatter = self.scatter_radio.isChecked()
         worker = TransferWorker(
             sd_info=d, dest_roots=dest_roots,
             ego_num=ego, prefix=prefix,
