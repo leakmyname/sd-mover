@@ -1,0 +1,11 @@
+{
+  "prefix": "ego",
+  "min_ext_gb": 700,
+  "auto_eject": true,
+  "auto_delete": true,
+  "start_delay_sec": 3,
+  "test_mode": true,
+  "max_concurrent_sd": 1,
+  "max_concurrent_hd": 1,
+  "scatter_mode": false
+}
