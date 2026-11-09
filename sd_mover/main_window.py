@@ -1007,7 +1007,7 @@ class MainWindow(QMainWindow):
             self._update_sd_status(letter, "已忽略")
             self._log(f"[{letter}] 已忽略未传输部分(已传输的已从SD卡删除)")
             self._set_sd_button(letter, "开始")
-        elif "断开" in error or "433" in error or "not ready" in error.lower():
+        elif "断开" in error or "433" in error or "Errno 22" in error or "not ready" in error.lower():
             self._log(f"[{letter}] [严重] 传输失败: 目标硬盘断开! {error}")
             self._update_sd_status(letter, "设备断开")
             self.tray.showMessage(

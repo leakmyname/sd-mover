@@ -58,9 +58,9 @@ def _is_path_too_long(exc):
 
 
 def _truncate_path(rel_path, max_len):
-    """截断过长的相对路径, 保留文件扩展名。
+    """截断过长的相对路径, 保留文件扩展名, 确保结果不超过 max_len。
 
-    策略: 如果完整路径太长, 缩短中间目录名。
+    策略: 保留扩展名, 尽量保留第一层目录和文件名, 中间截断。
     """
     if not rel_path or len(rel_path) <= max_len:
         return rel_path
@@ -69,22 +69,32 @@ def _truncate_path(rel_path, max_len):
     parts = root.replace('/', '\\').split('\\')
     if not parts:
         return rel_path
-    # 保留文件名(最后一部分), 尽量保留第一层目录
     filename = parts[-1]
     first_dir = parts[0] if len(parts) > 1 else ''
-    # 计算可用空间
-    overhead = len(ext) + 1  # +1 for separator
-    available = max_len - overhead
+    # 计算固定开销: ext + separator(如果有first_dir)
     if first_dir:
-        available -= len(first_dir) + 1
-    if available < 20:
-        available = 20
-    # 截断文件名
+        fixed = len(first_dir) + 1 + len(ext)
+    else:
+        fixed = len(ext)
+    available = max_len - fixed
+    if available < 10:
+        # first_dir太长, 也截断first_dir
+        if first_dir:
+            first_dir = first_dir[:max(5, (max_len - len(ext) - 10) // 3)]
+            fixed = len(first_dir) + 1 + len(ext)
+            available = max_len - fixed
+        if available < 10:
+            available = 10
+    # 截断文件名以适应可用空间
     if len(filename) > available:
-        filename = filename[:available - 8] + '_trunc'
-    if first_dir:
-        return first_dir + '\\' + filename + ext
-    return filename + ext
+        filename = filename[:max(1, available - 6)] + '_trunc'
+    result = (first_dir + '\\' + filename + ext) if first_dir else (filename + ext)
+    # 最终安全检查: 如果还是太长, 暴力截断
+    if len(result) > max_len:
+        # 保留扩展名, 截断中间
+        keep_ext = ext if len(ext) < max_len - 5 else ext[:3]
+        result = result[:max_len - len(keep_ext)] + keep_ext
+    return result
 
 
 class TransferWorker(QThread):
@@ -245,8 +255,12 @@ class TransferWorker(QThread):
                 disconnected = []
                 for dl, dr, _ in all_dests:
                     try:
-                        _, free = get_disk_usage(dr)
-                        alive_dests.append((dl, dr, free))
+                        total, free = get_disk_usage(dr)
+                        # total=0 means drive not ready / doesn't exist
+                        if total == 0:
+                            disconnected.append(dl)
+                        else:
+                            alive_dests.append((dl, dr, free))
                     except Exception:
                         disconnected.append(dl)
                 if disconnected:
@@ -354,9 +368,9 @@ class TransferWorker(QThread):
                         f"[{letter}] 路径过长, 已截断: {os.path.basename(fpath)}"
                     )
                 dst_path = os.path.join(current_dest_path, rel)
-                os.makedirs(_long_path(os.path.dirname(dst_path)), exist_ok=True)
                 fname = os.path.basename(fpath)
                 try:
+                    os.makedirs(_long_path(os.path.dirname(dst_path)), exist_ok=True)
                     copied = self._copy_file(fpath, dst_path, copied, total_size, fname, fsize)
                     copied_files.add(fpath)
                     file_idx += 1
