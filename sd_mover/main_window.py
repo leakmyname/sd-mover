@@ -649,7 +649,13 @@ class MainWindow(QMainWindow):
         )
         available = max(0, total_free - active_bytes)
         max_sd = self.max_concurrent_sd_spin.value()
+        max_hd = self.max_concurrent_hd_spin.value()
         started = len(self.processing)
+        # 当前正在写入的不同目标盘数量
+        active_dests = set()
+        for w in self.workers.values():
+            if w.primary_dest:
+                active_dests.add(w.primary_dest)
         # 整体文件模式: 不做空间预算, 允许启动(worker内部跳过放不下的文件)
         # 打散模式: 需要空间预算, 不够则排队等待新盘
         whole_mode = self.whole_radio.isChecked()
@@ -658,10 +664,41 @@ class MainWindow(QMainWindow):
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
                 continue
+            # 检查max_concurrent_hd: 如果当前写入盘数已达上限,
+            # 只有已绑定的盘不算新增
             data_size = card.total - card.free
+            # 找这张SD卡会绑定哪个盘(能装下数据的优先)
+            best_dest = None
+            bind_count = {}
+            for letter in sorted(self.ext_drives.keys()):
+                dr = self.ext_drives[letter]
+                _, free = get_disk_usage(dr.root)
+                bind_count[letter] = 0
+            for w in self.workers.values():
+                if w.primary_dest in bind_count:
+                    bind_count[w.primary_dest] += 1
+            all_dests = []
+            for letter in sorted(self.ext_drives.keys()):
+                dr = self.ext_drives[letter]
+                _, free = get_disk_usage(dr.root)
+                all_dests.append((letter, dr.root, free))
+            all_dests.sort(key=lambda x: x[2], reverse=True)
+            if all_dests:
+                best_dest = min(all_dests, key=lambda x: (
+                    0 if x[2] >= data_size else 1,
+                    bind_count[x[0]],
+                    -x[2]
+                ))[0]
+            # 如果best_dest是新的盘且当前已用盘数>=max_hd, 排队
+            if best_dest and best_dest not in active_dests and len(active_dests) >= max_hd:
+                self._ready_to_start.discard(card.letter)
+                self._queue_sd(card)
+                continue
             if whole_mode or data_size <= available:
                 if not whole_mode:
                     available -= data_size
+                if best_dest:
+                    active_dests.add(best_dest)
                 self._ready_to_start.discard(card.letter)
                 self._start_transfer(card)
                 started += 1
@@ -792,35 +829,32 @@ class MainWindow(QMainWindow):
             _, free = get_disk_usage(dr.root)
             all_dests_full.append((letter, dr.root, free))
         all_dests_full.sort(key=lambda x: x[2], reverse=True)
-        # Limit to max_concurrent_hd drives (most free first)
-        max_hd = self.max_concurrent_hd_spin.value()
-        active_roots = all_dests_full[:max_hd]
+        # 所有外部硬盘都作为候选目标盘(不限max_hd, 备选盘也可用于溢出)
         scatter = self.scatter_radio.isChecked()
-        # Bind this SD card to a PRIMARY dest so it fills one drive before
-        # switching. Round-robin among the active drives so multiple SD cards
-        # bind different drives for true parallel writes.
+        # Bind this SD card to a PRIMARY dest: 优先选能装下所有数据的盘
+        # 其次考虑并行(绑定数少), 最后选空间最大的
         primary_dest = ""
-        if active_roots:
+        if all_dests_full:
             # Count how many workers are already bound to each drive
             bind_count = {}
-            for l, r, _ in active_roots:
+            for l, r, _ in all_dests_full:
                 bind_count[l] = 0
             for w in self.workers.values():
                 if w.primary_dest in bind_count:
                     bind_count[w.primary_dest] += 1
-            # Pick the active drive with the fewest bindings first,
-            # so multiple SD cards spread across different drives for
-            # true parallel writes. Only prefer "can hold all data" as
-            # a tiebreaker, not as the primary criterion.
+            # 选盘优先级:
+            # 1. 能装下所有数据的盘 (最重要!)
+            # 2. 绑定数最少 (并行写入)
+            # 3. 剩余空间最大
             data_size = d.total - d.free
-            best = min(active_roots, key=lambda x: (
-                bind_count[x[0]],                # fewest bindings first (parallel!)
-                0 if x[2] >= data_size else 1,  # then prefer drives that can hold all
-                -x[2]                            # then most free space
+            best = min(all_dests_full, key=lambda x: (
+                0 if x[2] >= data_size else 1,  # 能装下优先!
+                bind_count[x[0]],               # 其次并行
+                -x[2]                            # 最后空间大
             ))
             primary_dest = best[0]
             # Warn if primary dest can't hold all the SD card's data
-            for l, r, free in active_roots:
+            for l, r, free in all_dests_full:
                 if l == primary_dest and free < data_size:
                     mode_hint = "将跳过放不下的文件" if not scatter else "写满后溢出到其他盘"
                     self._log(
@@ -828,7 +862,8 @@ class MainWindow(QMainWindow):
                         f"SD卡数据{format_size(data_size)}, {mode_hint}"
                     )
                     break
-        dest_roots = [(l, r) for l, r, _ in active_roots]
+        # dest_roots: 所有盘都传给worker作为候选(打散模式可溢出到其他盘)
+        dest_roots = [(l, r) for l, r, _ in all_dests_full]
         worker = TransferWorker(
             sd_info=d, dest_roots=dest_roots,
             ego_num=ego, prefix=prefix,
