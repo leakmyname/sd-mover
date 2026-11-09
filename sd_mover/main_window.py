@@ -808,12 +808,14 @@ class MainWindow(QMainWindow):
             for w in self.workers.values():
                 if w.primary_dest in bind_count:
                     bind_count[w.primary_dest] += 1
-            # Pick the active drive with the fewest bindings
-            # Prefer drives that can actually hold this SD card's data
+            # Pick the active drive with the fewest bindings first,
+            # so multiple SD cards spread across different drives for
+            # true parallel writes. Only prefer "can hold all data" as
+            # a tiebreaker, not as the primary criterion.
             data_size = d.total - d.free
             best = min(active_roots, key=lambda x: (
-                0 if x[2] >= data_size else 1,  # prefer drives that can hold all data
-                bind_count[x[0]],                # then fewest bindings
+                bind_count[x[0]],                # fewest bindings first (parallel!)
+                0 if x[2] >= data_size else 1,  # then prefer drives that can hold all
                 -x[2]                            # then most free space
             ))
             primary_dest = best[0]
@@ -1005,6 +1007,23 @@ class MainWindow(QMainWindow):
             self._update_sd_status(letter, "已忽略")
             self._log(f"[{letter}] 已忽略未传输部分(已传输的已从SD卡删除)")
             self._set_sd_button(letter, "开始")
+        elif "断开" in error or "433" in error or "not ready" in error.lower():
+            self._log(f"[{letter}] [严重] 传输失败: 目标硬盘断开! {error}")
+            self._update_sd_status(letter, "设备断开")
+            self.tray.showMessage(
+                "目标硬盘断开!",
+                f"SD卡 {letter} 传输中断: 目标硬盘已断开。\n"
+                f"请检查USB连接后点击重试。",
+                QSystemTrayIcon.Critical, 15000
+            )
+            self.warning_banner.setText(
+                f"!! 严重: 目标硬盘断开! SD卡 {letter} 传输中断, "
+                f"请检查USB连接后点击重试 !!"
+            )
+            self.warning_banner.show()
+            if not self._blink_timer.isActive():
+                self._blink_timer.start(500)
+            self._set_sd_button(letter, "重试")
         else:
             self._log(f"[{letter}] [ERR] 传输失败: {error}")
             self._update_sd_status(letter, "失败")

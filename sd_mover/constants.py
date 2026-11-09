@@ -10,6 +10,7 @@ CHUNK_SIZE = 8 * 1024 * 1024   # 8MB 分块拷贝
 POLL_INTERVAL_MS = 2000        # 驱动器轮询间隔(ms)
 STABILIZE_CHECKS = 2           # 稳定检测次数(防止相机还在写入)
 WARNING_THRESHOLD_GB = 10     # 剩余空间警告阈值(GB)
+MAX_PATH_LEN = 255             # Windows MAX_PATH 安全限制(留余量)
 
 # 跳过的系统文件/目录(小写)
 SKIP_ITEMS = {

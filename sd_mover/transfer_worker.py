@@ -9,7 +9,82 @@ from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .winapi import format_size, eject_drive, get_disk_usage
-from .constants import CHUNK_SIZE, SKIP_ITEMS
+from .constants import CHUNK_SIZE, SKIP_ITEMS, MAX_PATH_LEN
+
+
+def _long_path(path):
+    """将路径转换为 Windows 长路径格式 (\\\\?\\ 前缀), 绕过 MAX_PATH 260 限制。
+
+    仅对绝对路径且未已有前缀时添加。\\??\\ 前缀也支持。
+    """
+    if not path:
+        return path
+    # 已经是长路径格式
+    if path.startswith('\\\\?\\') or path.startswith('\\\\??\\'):
+        return path
+    # 只处理绝对路径 (如 C:\...)
+    if len(path) >= 2 and path[1] == ':':
+        # 规范化为绝对路径
+        abs_path = os.path.abspath(path)
+        return '\\\\?\\' + abs_path
+    return path
+
+
+def _is_device_error(exc):
+    """判断异常是否为目标设备断开 (WinError 433 / 设备不存在 / Errno 22 写入失败)
+
+    注意: USB设备断开过程中, Windows 可能先返回 Errno 22 (Invalid argument)
+    而不是 WinError 433, 所以也需要捕获。但如果同时有路径过长的情况,
+    会通过 _is_path_too_long 单独处理 (仅当 open 失败时)。
+    """
+    msg = str(exc)
+    if '433' in msg or 'WinError' in msg:
+        return True
+    if '不存在' in msg or 'not ready' in msg.lower():
+        return True
+    # Errno 22 在写入/读取大文件时通常意味着设备已断开
+    # (路径过长会被 _truncate_path 提前处理, 不会走到这里)
+    if 'Errno 22' in msg:
+        return True
+    return False
+
+
+def _is_path_too_long(exc):
+    """判断异常是否为路径过长 (Errno 22 on open/makedirs)"""
+    msg = str(exc)
+    if 'Errno 22' in msg or 'Invalid argument' in msg:
+        return True
+    return False
+
+
+def _truncate_path(rel_path, max_len):
+    """截断过长的相对路径, 保留文件扩展名。
+
+    策略: 如果完整路径太长, 缩短中间目录名。
+    """
+    if not rel_path or len(rel_path) <= max_len:
+        return rel_path
+    # 分离扩展名
+    root, ext = os.path.splitext(rel_path)
+    parts = root.replace('/', '\\').split('\\')
+    if not parts:
+        return rel_path
+    # 保留文件名(最后一部分), 尽量保留第一层目录
+    filename = parts[-1]
+    first_dir = parts[0] if len(parts) > 1 else ''
+    # 计算可用空间
+    overhead = len(ext) + 1  # +1 for separator
+    available = max_len - overhead
+    if first_dir:
+        available -= len(first_dir) + 1
+    if available < 20:
+        available = 20
+    # 截断文件名
+    if len(filename) > available:
+        filename = filename[:available - 8] + '_trunc'
+    if first_dir:
+        return first_dir + '\\' + filename + ext
+    return filename + ext
 
 
 class TransferWorker(QThread):
@@ -165,21 +240,49 @@ class TransferWorker(QThread):
                 # ── 选盘逻辑 ──
                 # 整体文件模式: 只用主盘(primary_dest), 放不下就跳过
                 # 打散模式: 先写主盘, 满了溢出到其他盘
+                # 先过滤掉已断开的目标盘 (get_disk_usage 失败=设备掉线)
+                alive_dests = []
+                disconnected = []
+                for dl, dr, _ in all_dests:
+                    try:
+                        _, free = get_disk_usage(dr)
+                        alive_dests.append((dl, dr, free))
+                    except Exception:
+                        disconnected.append(dl)
+                if disconnected:
+                    for dl in disconnected:
+                        self.log_message.emit(
+                            f"[{letter}] 目标盘 {dl} 已断开, 从列表移除"
+                        )
+                    all_dests = alive_dests
+                    if not all_dests:
+                        self.log_message.emit(
+                            f"[{letter}] [严重] 所有目标盘已断开! 已传输 {format_size(copied)}"
+                        )
+                        self.status_changed.emit(letter, "设备断开")
+                        self.transfer_failed.emit(letter, "所有目标盘断开")
+                        return
+                    # Re-sort
+                    if self.primary_dest:
+                        all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+                    else:
+                        all_dests.sort(key=lambda x: x[2], reverse=True)
+                else:
+                    all_dests = alive_dests
+                # 现在用 alive dests 的缓存 free 值, 不再重复调 get_disk_usage
                 if not self.scatter_mode and self.primary_dest:
                     # 整体文件: 只检查主盘
                     for i in range(len(all_dests)):
-                        dl, dr, _ = all_dests[i]
+                        dl, dr, free = all_dests[i]
                         if dl != self.primary_dest:
                             continue
-                        _, free = get_disk_usage(dr)
                         if free >= fsize + 1024 * 1024:
                             chosen = i
                         break
                 else:
                     # 打散: 先主盘, 满了再其他盘
                     for i in range(len(all_dests)):
-                        dl, dr, _ = all_dests[i]
-                        _, free = get_disk_usage(dr)
+                        dl, dr, free = all_dests[i]
                         if free >= fsize + 1024 * 1024:
                             chosen = i
                             break
@@ -188,10 +291,9 @@ class TransferWorker(QThread):
                     if not self.scatter_mode:
                         # 整体文件模式: 主盘放不下, 跳过此文件
                         pfree_str = "未知"
-                        for dl, dr, _ in all_dests:
+                        for dl, dr, _free in all_dests:
                             if dl == self.primary_dest:
-                                _, pf = get_disk_usage(dr)
-                                pfree_str = format_size(pf)
+                                pfree_str = format_size(_free)
                                 break
                         self.log_message.emit(
                             f"[{letter}] 跳过(主盘{self.primary_dest}放不下): "
@@ -219,7 +321,6 @@ class TransferWorker(QThread):
                         self._cancelled(letter, copied)
                         return
                     continue
-
                 dest_idx = chosen
                 dest_letter, dest_root, _ = all_dests[dest_idx]
 
@@ -240,8 +341,20 @@ class TransferWorker(QThread):
                     )
 
                 rel = os.path.relpath(fpath, src_root)
+                # 检查目标路径长度, 如果太长则截断
+                base_dest_len = len(current_dest_path)
+                rel_len = len(rel)
+                if base_dest_len + 1 + rel_len > MAX_PATH_LEN:
+                    # 需要截断: 保留扩展名和关键信息
+                    available = MAX_PATH_LEN - base_dest_len - 1
+                    if available < 20:
+                        available = 20
+                    rel = _truncate_path(rel, available)
+                    self.log_message.emit(
+                        f"[{letter}] 路径过长, 已截断: {os.path.basename(fpath)}"
+                    )
                 dst_path = os.path.join(current_dest_path, rel)
-                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                os.makedirs(_long_path(os.path.dirname(dst_path)), exist_ok=True)
                 fname = os.path.basename(fpath)
                 try:
                     copied = self._copy_file(fpath, dst_path, copied, total_size, fname, fsize)
@@ -249,7 +362,22 @@ class TransferWorker(QThread):
                     file_idx += 1
                 except Exception as e:
                     errors.append((fpath, str(e)))
-                    self.log_message.emit(f"[{letter}] 错误: {fname} - {e}")
+                    if _is_device_error(e):
+                        # 目标盘断开, 立即停止传输
+                        self.log_message.emit(
+                            f"[{letter}] [严重] 目标盘 {dest_letter} 已断开! "
+                            f"已传输 {format_size(copied)}"
+                        )
+                        self.status_changed.emit(letter, "设备断开")
+                        self.transfer_failed.emit(letter, f"目标盘 {dest_letter} 断开")
+                        return
+                    elif _is_path_too_long(e):
+                        self.log_message.emit(
+                            f"[{letter}] 路径过长, 跳过: {fname} "
+                            f"(路径 {len(dst_path)} 字符)"
+                        )
+                    else:
+                        self.log_message.emit(f"[{letter}] 错误: {fname} - {e}")
                     file_idx += 1
 
             self.progress_updated.emit(letter, copied, total_size, "", 0, 0, 0)
@@ -295,7 +423,19 @@ class TransferWorker(QThread):
             self.log_message.emit(f"[{letter}] 传输失败: {e}")
 
     def _copy_file(self, src, dst, offset, total, fname, file_size):
-        with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+        # 使用长路径前缀绕过 Windows MAX_PATH 260 限制
+        src_lp = _long_path(src)
+        dst_lp = _long_path(dst)
+        try:
+            fsrc = open(src_lp, 'rb')
+        except OSError as e:
+            raise OSError(f"无法读取源文件: {fname} - {e}")
+        try:
+            fdst = open(dst_lp, 'wb')
+        except OSError as e:
+            fsrc.close()
+            raise OSError(f"无法创建目标文件: {fname} - {e}")
+        try:
             file_copied = 0
             while True:
                 if self.is_cancelled:
@@ -317,8 +457,34 @@ class TransferWorker(QThread):
                         self.sd_info.letter, offset, total, fname, speed,
                         file_copied, file_size
                     )
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        except OSError:
+            # 写入失败(设备断开等), 删除不完整的目标文件
+            try:
+                fdst.close()
+            except Exception:
+                pass
+            try:
+                fsrc.close()
+            except Exception:
+                pass
+            try:
+                os.remove(dst_lp)
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                fdst.close()
+            except Exception:
+                pass
+            try:
+                fsrc.close()
+            except Exception:
+                pass
         try:
-            shutil.copystat(src, dst)
+            shutil.copystat(src_lp, dst_lp)
         except Exception:
             pass
         return offset
