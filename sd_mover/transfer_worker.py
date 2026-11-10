@@ -199,9 +199,9 @@ class TransferWorker(QThread):
             # Primary dest goes first so this SD card writes to its bound drive
             # until full, then falls back to others
             if self.primary_dest:
-                all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+                all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, x[2]))
             else:
-                all_dests.sort(key=lambda x: x[2], reverse=True)
+                all_dests.sort(key=lambda x: x[2])
             if all_dests:
                 pdesc = f" (绑定 {self.primary_dest})" if self.primary_dest else ""
                 self.log_message.emit(
@@ -240,9 +240,9 @@ class TransferWorker(QThread):
                         self._new_dests.clear()
                         # Re-sort: primary_dest first, then by free desc
                         if self.primary_dest:
-                            all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+                            all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, x[2]))
                         else:
-                            all_dests.sort(key=lambda x: x[2], reverse=True)
+                            all_dests.sort(key=lambda x: x[2])
 
                 fpath, fsize = files[file_idx]
                 chosen = None
@@ -278,9 +278,9 @@ class TransferWorker(QThread):
                         return
                     # Re-sort
                     if self.primary_dest:
-                        all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, -x[2]))
+                        all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, x[2]))
                     else:
-                        all_dests.sort(key=lambda x: x[2], reverse=True)
+                        all_dests.sort(key=lambda x: x[2])
                 else:
                     all_dests = alive_dests
                 # 现在用 alive dests 的缓存 free 值, 不再重复调 get_disk_usage

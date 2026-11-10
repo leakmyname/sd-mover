@@ -687,7 +687,7 @@ class MainWindow(QMainWindow):
                 best_dest = min(all_dests, key=lambda x: (
                     0 if x[2] >= data_size else 1,
                     bind_count[x[0]],
-                    -x[2]
+                    x[2]
                 ))[0]
             # 如果best_dest是新的盘且当前已用盘数>=max_hd, 排队
             if best_dest and best_dest not in active_dests and len(active_dests) >= max_hd:
@@ -845,14 +845,25 @@ class MainWindow(QMainWindow):
             # 选盘优先级:
             # 1. 能装下所有数据的盘 (最重要!)
             # 2. 绑定数最少 (并行写入)
-            # 3. 剩余空间最大
+            # 3. 剩余空间最小 (先填满小盘)
             data_size = d.total - d.free
             best = min(all_dests_full, key=lambda x: (
                 0 if x[2] >= data_size else 1,  # 能装下优先!
                 bind_count[x[0]],               # 其次并行
-                -x[2]                            # 最后空间大
+                x[2]                             # 最后空间小(先填满小盘)
             ))
             primary_dest = best[0]
+            # 整体文件模式: 如果没有盘能装下整个SD卡数据, 不开始传输
+            if not scatter:
+                can_hold = [l for l, r, f in all_dests_full if f >= data_size]
+                if not can_hold:
+                    self._log(
+                        f"[{d.letter}] 警告: 没有目标盘能装下SD卡数据"
+                        f"({format_size(data_size)}), 已排队等待新盘"
+                    )
+                    self._ready_to_start.discard(d.letter)
+                    self._queue_sd(d)
+                    return
             # Warn if primary dest can't hold all the SD card's data
             for l, r, free in all_dests_full:
                 if l == primary_dest and free < data_size:
