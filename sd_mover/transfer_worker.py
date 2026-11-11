@@ -276,6 +276,13 @@ class TransferWorker(QThread):
                         self.status_changed.emit(letter, "设备断开")
                         self.transfer_failed.emit(letter, "所有目标盘断开")
                         return
+                    # 主盘掉线: 重新绑定到空间最小的存活盘
+                    if self.primary_dest and self.primary_dest in disconnected:
+                        old_primary = self.primary_dest
+                        self.primary_dest = min(alive_dests, key=lambda x: x[2])[0]
+                        self.log_message.emit(
+                            f"[{letter}] 主盘{old_primary}已断开, 改绑到{self.primary_dest}"
+                        )
                     # Re-sort
                     if self.primary_dest:
                         all_dests.sort(key=lambda x: (0 if x[0] == self.primary_dest else 1, x[2]))
@@ -284,15 +291,21 @@ class TransferWorker(QThread):
                 else:
                     all_dests = alive_dests
                 # 现在用 alive dests 的缓存 free 值, 不再重复调 get_disk_usage
-                if not self.scatter_mode and self.primary_dest:
-                    # 整体文件: 只检查主盘
-                    for i in range(len(all_dests)):
+                # 整体文件模式: 文件必须完整放入某一个盘, 主盘优先, 其次空间小的盘
+                # 打散模式: 先主盘, 满了再其他盘
+                if not self.scatter_mode:
+                    order = list(range(len(all_dests)))
+                    if self.primary_dest:
+                        # 主盘排最前, 其余按剩余空间升序(先填满小盘)
+                        order.sort(key=lambda i: (
+                            0 if all_dests[i][0] == self.primary_dest else 1,
+                            all_dests[i][2]
+                        ))
+                    for i in order:
                         dl, dr, free = all_dests[i]
-                        if dl != self.primary_dest:
-                            continue
                         if free >= fsize + 1024 * 1024:
                             chosen = i
-                        break
+                            break
                 else:
                     # 打散: 先主盘, 满了再其他盘
                     for i in range(len(all_dests)):
@@ -309,10 +322,13 @@ class TransferWorker(QThread):
                             if dl == self.primary_dest:
                                 pfree_str = format_size(_free)
                                 break
+                        all_free = ", ".join(
+                            f"{dl}:{format_size(fr)}" for dl, _dr, fr in all_dests
+                        )
                         self.log_message.emit(
-                            f"[{letter}] 跳过(主盘{self.primary_dest}放不下): "
+                            f"[{letter}] 跳过(所有盘都放不下该文件): "
                             f"{os.path.basename(fpath)} ({format_size(fsize)}, "
-                            f"主盘剩余{pfree_str})"
+                            f"主盘{self.primary_dest}剩余{pfree_str}, 各盘剩余: {all_free})"
                         )
                         file_idx += 1
                         continue

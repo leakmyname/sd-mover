@@ -861,6 +861,7 @@ class MainWindow(QMainWindow):
                         f"[{d.letter}] 警告: 没有目标盘能装下SD卡数据"
                         f"({format_size(data_size)}), 已排队等待新盘"
                     )
+                    self.processing.discard(d.letter)
                     self._ready_to_start.discard(d.letter)
                     self._queue_sd(d)
                     return
