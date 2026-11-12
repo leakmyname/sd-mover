@@ -646,12 +646,6 @@ class MainWindow(QMainWindow):
         if not ready:
             return
         ready.sort(key=lambda x: x.total - x.free, reverse=True)
-        total_free = sum(dr.free for dr in self.ext_drives.values())
-        active_bytes = sum(
-            (w.sd_info.total - w.sd_info.free)
-            for w in self.workers.values()
-        )
-        available = max(0, total_free - active_bytes)
         max_sd = self.max_concurrent_sd_spin.value()
         max_hd = self.max_concurrent_hd_spin.value()
         started = len(self.processing)
@@ -660,12 +654,10 @@ class MainWindow(QMainWindow):
         for w in self.workers.values():
             if w.primary_dest:
                 active_dests.add(w.primary_dest)
-        # 整体文件模式: 不做空间预算, 允许启动(worker内部跳过放不下的文件)
-        # 打散模式: 需要空间预算, 不够则排队等待新盘
         whole_mode = self.whole_radio.isChecked()
-        # 预占空间: 每张卡选盘时, 把同批次已分配的卡的容量从该盘可用空间中扣除,
-        # 避免多张卡同时看到同一盘的相同剩余空间而全部绑到该盘导致溢出
-        reserved = {}   # letter -> bytes already reserved by this batch
+        # 预占表: 本批次里每张卡按"实际能写进多少"扣除对应盘的可用空间,
+        # 避免多张卡同时看到同一块盘的相同剩余空间而全部挤进去(过订阅)
+        reserved = {}
         bind_count = {}
         for letter in sorted(self.ext_drives.keys()):
             dr = self.ext_drives[letter]
@@ -677,9 +669,6 @@ class MainWindow(QMainWindow):
             if w.primary_dest in bind_count:
                 bind_count[w.primary_dest] += 1
                 reserved[w.primary_dest] += (w.sd_info.total - w.sd_info.free)
-        # 排队中的卡也预占, 避免重复分配
-        for qd in self.pending_queue:
-            pass  # pending cards not yet assigned to a drive
 
         for card in ready:
             if started >= max_sd:
@@ -687,46 +676,58 @@ class MainWindow(QMainWindow):
                 self._queue_sd(card)
                 continue
             data_size = card.total - card.free
-            # 实时可用空间 = 磁盘剩余 - 已预占
-            all_dests = []
+            # 实时可用空间 = 磁盘剩余 - 本批次已预占
+            usable = {}
             for letter in sorted(self.ext_drives.keys()):
                 dr = self.ext_drives[letter]
                 _, free = get_disk_usage(dr.root)
-                usable = max(0, free - reserved.get(letter, 0))
-                all_dests.append((letter, dr.root, usable))
-            all_dests.sort(key=lambda x: x[2], reverse=True)
-            best_dest = None
-            if all_dests:
-                best_dest = min(all_dests, key=lambda x: (
-                    0 if x[2] >= data_size else 1,   # 能装下优先
-                    bind_count[x[0]],                # 其次并行
-                    x[2]                             # 最后空间小(先填满小盘)
-                ))[0]
-            # 如果best_dest是新的盘且当前已用盘数>=max_hd, 排队
-            if best_dest and best_dest not in active_dests and len(active_dests) >= max_hd:
+                usable[letter] = max(0, free - reserved.get(letter, 0))
+
+            if whole_mode:
+                # 整体文件模式: 必须有一块盘能完整装下整张卡, 否则排队等新盘
+                cands = [(l, u) for l, u in usable.items() if u >= data_size]
+                if not cands:
+                    self._ready_to_start.discard(card.letter)
+                    self._queue_sd(card)
+                    continue
+                best = min(cands, key=lambda x: (bind_count[x[0]], x[1]))
+                plan = [(best[0], data_size)]
+            else:
+                # 打散模式: 依次把数据分摊到多块盘(先并行少的盘, 再先填满小盘),
+                # 每块盘只预占真正写得进去的字节数。这样多张卡就不会同时看到
+                # 同一块盘的相同剩余空间而全部挤进去, 导致写出一堆不完整的文件。
+                remaining = data_size
+                plan = []
+                while remaining > 0:
+                    taken = [p[0] for p in plan]
+                    cands = [(l, u) for l, u in usable.items()
+                             if u > 0 and l not in taken]
+                    if not cands:
+                        break
+                    bl = min(cands, key=lambda x: (bind_count[x[0]], x[1]))[0]
+                    take = min(remaining, usable[bl])
+                    plan.append((bl, take))
+                    remaining -= take
+                if remaining > 0:
+                    # 所有盘加起来也装不下: 排队等新硬盘, 不硬塞
+                    self._ready_to_start.discard(card.letter)
+                    self._queue_sd(card)
+                    continue
+
+            # 并发盘数上限: 本批次新用到的盘数不能把 active_dests 撑超 max_hd
+            new_disks = [l for l, _ in plan if l not in active_dests]
+            if new_disks and len(active_dests) + len(new_disks) > max_hd:
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
                 continue
-            # 空间检查: 整体文件模式要求选中的盘装得下; 打散模式看全局预算
-            if whole_mode:
-                ok = best_dest is not None and any(
-                    x[2] >= data_size for x in all_dests
-                )
-            else:
-                ok = data_size <= available
-            if ok:
-                if not whole_mode:
-                    available -= data_size
-                if best_dest:
-                    active_dests.add(best_dest)
-                    reserved[best_dest] += data_size
-                    bind_count[best_dest] += 1
-                self._ready_to_start.discard(card.letter)
-                self._start_transfer(card, forced_primary=best_dest)
-                started += 1
-            else:
-                self._ready_to_start.discard(card.letter)
-                self._queue_sd(card)
+
+            for bl, take in plan:
+                reserved[bl] += take
+                bind_count[bl] += 1
+                active_dests.add(bl)
+            self._ready_to_start.discard(card.letter)
+            self._start_transfer(card, forced_primary=plan[0][0])
+            started += 1
 
     def _queue_sd(self, d):
         if d.letter in self.waiting_set:

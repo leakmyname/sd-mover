@@ -391,24 +391,30 @@ class TransferWorker(QThread):
                     copied_files.add(fpath)
                     file_idx += 1
                 except Exception as e:
-                    errors.append((fpath, str(e)))
-                    if _is_device_error(e):
-                        # 目标盘断开, 立即停止传输
-                        self.log_message.emit(
-                            f"[{letter}] [严重] 目标盘 {dest_letter} 已断开! "
-                            f"已传输 {format_size(copied)}"
-                        )
-                        self.status_changed.emit(letter, "设备断开")
-                        self.transfer_failed.emit(letter, f"目标盘 {dest_letter} 断开")
-                        return
-                    elif _is_path_too_long(e):
-                        self.log_message.emit(
-                            f"[{letter}] 路径过长, 跳过: {fname} "
-                            f"(路径 {len(dst_path)} 字符)"
-                        )
+                    if isinstance(e, RuntimeError) and "Cancelled" in str(e):
+                        # Cancelled mid-copy: _copy_file already deleted the
+                        # partial file.  Fall through to the cancel check at
+                        # the top of the while loop, which calls _cancelled().
+                        pass
                     else:
-                        self.log_message.emit(f"[{letter}] 错误: {fname} - {e}")
-                    file_idx += 1
+                        errors.append((fpath, str(e)))
+                        if _is_device_error(e):
+                            # 目标盘断开, 立即停止传输
+                            self.log_message.emit(
+                                f"[{letter}] [严重] 目标盘 {dest_letter} 已断开! "
+                                f"已传输 {format_size(copied)}"
+                            )
+                            self.status_changed.emit(letter, "设备断开")
+                            self.transfer_failed.emit(letter, f"目标盘 {dest_letter} 断开")
+                            return
+                        elif _is_path_too_long(e):
+                            self.log_message.emit(
+                                f"[{letter}] 路径过长, 跳过: {fname} "
+                                f"(路径 {len(dst_path)} 字符)"
+                            )
+                        else:
+                            self.log_message.emit(f"[{letter}] 错误: {fname} - {e}")
+                        file_idx += 1
 
             self.progress_updated.emit(letter, copied, total_size, "", 0, 0, 0)
 
@@ -489,8 +495,9 @@ class TransferWorker(QThread):
                     )
             fdst.flush()
             os.fsync(fdst.fileno())
-        except OSError:
-            # 写入失败(设备断开等), 删除不完整的目标文件
+        except (OSError, RuntimeError):
+            # 写入失败(设备断开等)或用户取消, 删除不完整的目标文件,
+            # 保证取消后目标盘不残留半个文件
             try:
                 fdst.close()
             except Exception:
