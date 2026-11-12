@@ -169,16 +169,17 @@ class MainWindow(QMainWindow):
         # 目标硬盘表
         ext_group = QGroupBox("目标硬盘 (外部存储) - 支持多盘, 一个满了自动切换")
         ext_layout = QVBoxLayout(ext_group)
-        self.ext_table = QTableWidget(0, 7)
-        self.ext_table.setHorizontalHeaderLabels(["盘符","标签","容量","剩余","使用率","硬盘盒SN","标签","弹出"])
+        self.ext_table = QTableWidget(0, 8)
+        self.ext_table.setHorizontalHeaderLabels(
+            ["盘符","标签","容量","剩余","使用率","硬盘盒SN","硬盘盒","弹出"])
         h = self.ext_table.horizontalHeader()
-        h.setSectionResizeMode(5, QHeaderView.Stretch)
+        h.setSectionResizeMode(6, QHeaderView.Stretch)
         self.ext_table.setColumnWidth(0, 60)
         self.ext_table.setColumnWidth(1, 120)
         self.ext_table.setColumnWidth(2, 100)
         self.ext_table.setColumnWidth(3, 100)
         self.ext_table.setColumnWidth(4, 80)
-        self.ext_table.setColumnWidth(6, 90)
+        self.ext_table.setColumnWidth(7, 60)
         self.ext_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.ext_table.setSelectionMode(QAbstractItemView.NoSelection)
         ext_layout.addWidget(self.ext_table)
@@ -721,7 +722,7 @@ class MainWindow(QMainWindow):
                     reserved[best_dest] += data_size
                     bind_count[best_dest] += 1
                 self._ready_to_start.discard(card.letter)
-                self._start_transfer(card)
+                self._start_transfer(card, forced_primary=best_dest)
                 started += 1
             else:
                 self._ready_to_start.discard(card.letter)
@@ -859,10 +860,8 @@ class MainWindow(QMainWindow):
         self.ego_counter = nxt
         return nxt
 
-    def _start_transfer(self, d):
+    def _start_transfer(self, d, forced_primary=None):
         self.processing.add(d.letter)
-        ego = self._next_ego()
-        prefix = self.prefix_edit.text() or DEFAULT_PREFIX
         # Build full dest list (all external drives), sorted by free desc
         all_dests_full = []
         for letter in sorted(self.ext_drives.keys()):
@@ -872,10 +871,11 @@ class MainWindow(QMainWindow):
         all_dests_full.sort(key=lambda x: x[2], reverse=True)
         # 所有外部硬盘都作为候选目标盘(不限max_hd, 备选盘也可用于溢出)
         scatter = self.scatter_radio.isChecked()
+        data_size = d.total - d.free
         # Bind this SD card to a PRIMARY dest: 优先选能装下所有数据的盘
         # 其次考虑并行(绑定数少), 最后选空间最大的
-        primary_dest = ""
-        if all_dests_full:
+        primary_dest = forced_primary or ""
+        if all_dests_full and not primary_dest:
             # Count how many workers are already bound to each drive
             bind_count = {}
             for l, r, _ in all_dests_full:
@@ -887,13 +887,13 @@ class MainWindow(QMainWindow):
             # 1. 能装下所有数据的盘 (最重要!)
             # 2. 绑定数最少 (并行写入)
             # 3. 剩余空间最小 (先填满小盘)
-            data_size = d.total - d.free
             best = min(all_dests_full, key=lambda x: (
                 0 if x[2] >= data_size else 1,  # 能装下优先!
                 bind_count[x[0]],               # 其次并行
                 x[2]                             # 最后空间小(先填满小盘)
             ))
             primary_dest = best[0]
+        if all_dests_full:
             # 整体文件模式: 如果没有盘能装下整个SD卡数据, 不开始传输
             if not scatter:
                 can_hold = [l for l, r, f in all_dests_full if f >= data_size]
@@ -915,6 +915,8 @@ class MainWindow(QMainWindow):
                         f"SD卡数据{format_size(data_size)}, {mode_hint}"
                     )
                     break
+        ego = self._next_ego()
+        prefix = self.prefix_edit.text() or DEFAULT_PREFIX
         # dest_roots: 所有盘都传给worker作为候选(打散模式可溢出到其他盘)
         dest_roots = [(l, r) for l, r, _ in all_dests_full]
         worker = TransferWorker(
@@ -974,10 +976,18 @@ class MainWindow(QMainWindow):
         cont_btn = box.addButton("继续", QMessageBox.AcceptRole)
         ign_btn = box.addButton("忽略", QMessageBox.RejectRole)
         box.setDefaultButton(cont_btn)
-        self.raise_()
-        self.activateWindow()
-        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
-        reply = box.exec_()
+        # 防止递归调用(新增失败时会重新进入)导致栈溢出
+        if getattr(self, '_need_space_busy', None) == letter:
+            return
+        self._need_space_busy = letter
+        try:
+            self.raise_()
+            self.activateWindow()
+            self.setWindowState(
+                self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+            reply = box.exec_()
+        finally:
+            self._need_space_busy = None
         if reply == QMessageBox.RejectRole:
             worker.give_up()
             self._log(f"[{letter}] 用户选择忽略, 放弃未传输部分")
@@ -1007,11 +1017,19 @@ class MainWindow(QMainWindow):
             if added == 0:
                 QMessageBox.information(
                     self, "未检测到新硬盘",
-                    "未检测到新的目标硬盘, 请插入后再点继续。"
+                    "未检测到新的目标硬盘。\n"
+                    "请插入新硬盘后再次点击该SD卡的\"开始\"按钮。"
                 )
-                self._on_need_space(letter, remaining_files, remaining_bytes)
 
     def _on_progress(self, letter, copied, total, fname, speed, file_copied, file_total):
+        try:
+            self._on_progress_impl(letter, copied, total, fname, speed,
+                                  file_copied, file_total)
+        except Exception as e:
+            self._log(f"[{letter}] 进度更新异常: {e}")
+
+    def _on_progress_impl(self, letter, copied, total, fname, speed,
+                          file_copied, file_total):
         row = self._find_row(letter)
         if row < 0:
             return
@@ -1043,6 +1061,27 @@ class MainWindow(QMainWindow):
                 eta_item.setText("--")
 
     def _on_completed(self, letter, dest_letter, dest_path, bytes_tx, file_count):
+        try:
+            self._on_completed_impl(letter, dest_letter, dest_path,
+                                    bytes_tx, file_count)
+        except Exception as e:
+            self._log(f"[{letter}] 完成回调异常: {e}")
+            # 确保 worker 依然被清理, 不要卡在 processing 里
+            self.processing.discard(letter)
+            old_w = self.workers.pop(letter, None)
+            if old_w is not None:
+                try:
+                    if old_w.isRunning():
+                        old_w.wait(5000)
+                except Exception:
+                    pass
+                try:
+                    old_w.deleteLater()
+                except Exception:
+                    pass
+            self._schedule_plan()
+
+    def _on_completed_impl(self, letter, dest_letter, dest_path, bytes_tx, file_count):
         self.session_transferred += bytes_tx
         self.session_sd_count += 1
         if self.test_mode_cb.isChecked():
@@ -1097,6 +1136,25 @@ class MainWindow(QMainWindow):
         self._schedule_plan()
 
     def _on_failed(self, letter, error):
+        try:
+            self._on_failed_impl(letter, error)
+        except Exception as e:
+            self._log(f"[{letter}] 失败回调异常: {e}")
+            self.processing.discard(letter)
+            old_w = self.workers.pop(letter, None)
+            if old_w is not None:
+                try:
+                    if old_w.isRunning():
+                        old_w.wait(5000)
+                except Exception:
+                    pass
+                try:
+                    old_w.deleteLater()
+                except Exception:
+                    pass
+            self._schedule_plan()
+
+    def _on_failed_impl(self, letter, error):
         # Mark completed to prevent auto-restart loop (user can manually restart)
         self._completed_sd.add(letter)
         if error == "CANCELLED":
@@ -1262,8 +1320,9 @@ class MainWindow(QMainWindow):
         elif status in ("已完成", "已弹出"):
             row2 = self._find_row(letter)
             if row2 >= 0:
-                btn = self.sd_table.cellWidget(row2, 6)
+                btn = self.sd_table.cellWidget(row2, 7)
                 if btn:
+                    btn.setText("已完成")
                     btn.setEnabled(False)
 
     def closeEvent(self, event):
