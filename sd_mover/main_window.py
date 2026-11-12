@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont, QColor, QTextCursor
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .constants import (
-    POLL_INTERVAL_MS, STABILIZE_CHECKS, WARNING_THRESHOLD_GB,
+    APP_VERSION, POLL_INTERVAL_MS, STABILIZE_CHECKS, WARNING_THRESHOLD_GB,
     DEFAULT_PREFIX, DEFAULT_AUTO_EJECT, DEFAULT_AUTO_DELETE,
     DEFAULT_START_DELAY_SEC, DEFAULT_MAX_CONCURRENT_SD,
     DEFAULT_MAX_CONCURRENT_HD, DEFAULT_SCATTER_MODE
@@ -30,7 +30,7 @@ from .transfer_worker import TransferWorker
 from .winapi import (
     format_size, get_disk_usage,
     refresh_serial_cache, get_cached_usb_serial, get_cached_reader_serial,
-    pop_refresh_done
+    pop_refresh_done, eject_drive, release_drive_handles
 )
 from .log_manager import LogManager
 
@@ -50,7 +50,7 @@ def format_eta(seconds):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SD卡自动转存工具 (多硬盘版)")
+        self.setWindowTitle(f"SD卡自动转存工具 (多硬盘版) {APP_VERSION}")
         self.setMinimumSize(950, 720)
         self.resize(1050, 780)
         self.ext_drives = {}
@@ -70,6 +70,8 @@ class MainWindow(QMainWindow):
         self._test_processed = set()  # SD cards already transferred in test mode
         self._completed_sd = set()  # SD letters already completed (avoid auto-restart loop)
         self._ready_to_start = set()
+        self._plan_busy = False
+        self._plan_pending = False
         self._serial_refreshing = False
         self._serial_refresh_timer = QTimer()
         self._serial_refresh_timer.timeout.connect(self._check_serial_refresh)
@@ -168,7 +170,7 @@ class MainWindow(QMainWindow):
         ext_group = QGroupBox("目标硬盘 (外部存储) - 支持多盘, 一个满了自动切换")
         ext_layout = QVBoxLayout(ext_group)
         self.ext_table = QTableWidget(0, 7)
-        self.ext_table.setHorizontalHeaderLabels(["盘符","标签","容量","剩余","使用率","硬盘盒SN","标签"])
+        self.ext_table.setHorizontalHeaderLabels(["盘符","标签","容量","剩余","使用率","硬盘盒SN","标签","弹出"])
         h = self.ext_table.horizontalHeader()
         h.setSectionResizeMode(5, QHeaderView.Stretch)
         self.ext_table.setColumnWidth(0, 60)
@@ -185,8 +187,8 @@ class MainWindow(QMainWindow):
         # SD卡列表
         sd_group = QGroupBox("SD卡列表")
         sd_layout = QVBoxLayout(sd_group)
-        self.sd_table = QTableWidget(0, 8)
-        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","操作"])
+        self.sd_table = QTableWidget(0, 9)
+        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","操作","弹出"])
         h = self.sd_table.horizontalHeader()
         h.setSectionResizeMode(6, QHeaderView.Stretch)
         h.setSectionResizeMode(4, QHeaderView.Fixed)
@@ -198,6 +200,7 @@ class MainWindow(QMainWindow):
         self.sd_table.setColumnWidth(4, 180)
         self.sd_table.setColumnWidth(5, 90)
         self.sd_table.setColumnWidth(7, 80)
+        self.sd_table.setColumnWidth(8, 60)
         self.sd_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sd_table.setSelectionMode(QAbstractItemView.NoSelection)
         sd_layout.addWidget(self.sd_table)
@@ -659,46 +662,64 @@ class MainWindow(QMainWindow):
         # 整体文件模式: 不做空间预算, 允许启动(worker内部跳过放不下的文件)
         # 打散模式: 需要空间预算, 不够则排队等待新盘
         whole_mode = self.whole_radio.isChecked()
+        # 预占空间: 每张卡选盘时, 把同批次已分配的卡的容量从该盘可用空间中扣除,
+        # 避免多张卡同时看到同一盘的相同剩余空间而全部绑到该盘导致溢出
+        reserved = {}   # letter -> bytes already reserved by this batch
+        bind_count = {}
+        for letter in sorted(self.ext_drives.keys()):
+            dr = self.ext_drives[letter]
+            _, free = get_disk_usage(dr.root)
+            bind_count[letter] = 0
+            reserved[letter] = 0
+        # 已有worker的绑定数与占用
+        for w in self.workers.values():
+            if w.primary_dest in bind_count:
+                bind_count[w.primary_dest] += 1
+                reserved[w.primary_dest] += (w.sd_info.total - w.sd_info.free)
+        # 排队中的卡也预占, 避免重复分配
+        for qd in self.pending_queue:
+            pass  # pending cards not yet assigned to a drive
+
         for card in ready:
             if started >= max_sd:
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
                 continue
-            # 检查max_concurrent_hd: 如果当前写入盘数已达上限,
-            # 只有已绑定的盘不算新增
             data_size = card.total - card.free
-            # 找这张SD卡会绑定哪个盘(能装下数据的优先)
-            best_dest = None
-            bind_count = {}
-            for letter in sorted(self.ext_drives.keys()):
-                dr = self.ext_drives[letter]
-                _, free = get_disk_usage(dr.root)
-                bind_count[letter] = 0
-            for w in self.workers.values():
-                if w.primary_dest in bind_count:
-                    bind_count[w.primary_dest] += 1
+            # 实时可用空间 = 磁盘剩余 - 已预占
             all_dests = []
             for letter in sorted(self.ext_drives.keys()):
                 dr = self.ext_drives[letter]
                 _, free = get_disk_usage(dr.root)
-                all_dests.append((letter, dr.root, free))
+                usable = max(0, free - reserved.get(letter, 0))
+                all_dests.append((letter, dr.root, usable))
             all_dests.sort(key=lambda x: x[2], reverse=True)
+            best_dest = None
             if all_dests:
                 best_dest = min(all_dests, key=lambda x: (
-                    0 if x[2] >= data_size else 1,
-                    bind_count[x[0]],
-                    x[2]
+                    0 if x[2] >= data_size else 1,   # 能装下优先
+                    bind_count[x[0]],                # 其次并行
+                    x[2]                             # 最后空间小(先填满小盘)
                 ))[0]
             # 如果best_dest是新的盘且当前已用盘数>=max_hd, 排队
             if best_dest and best_dest not in active_dests and len(active_dests) >= max_hd:
                 self._ready_to_start.discard(card.letter)
                 self._queue_sd(card)
                 continue
-            if whole_mode or data_size <= available:
+            # 空间检查: 整体文件模式要求选中的盘装得下; 打散模式看全局预算
+            if whole_mode:
+                ok = best_dest is not None and any(
+                    x[2] >= data_size for x in all_dests
+                )
+            else:
+                ok = data_size <= available
+            if ok:
                 if not whole_mode:
                     available -= data_size
                 if best_dest:
                     active_dests.add(best_dest)
+                    reserved[best_dest] += data_size
+                    bind_count[best_dest] += 1
                 self._ready_to_start.discard(card.letter)
                 self._start_transfer(card)
                 started += 1
@@ -718,12 +739,26 @@ class MainWindow(QMainWindow):
             f"(数据 {format_size(d.total - d.free)})"
         )
 
+    def _schedule_plan(self):
+        """防止 _plan_and_start 重入: 正在计划中就标记为待处理"""
+        if self._plan_busy:
+            self._plan_pending = True
+            return
+        self._try_start_queued()
+
     def _try_start_queued(self):
-        for d in self.pending_queue:
-            self._ready_to_start.add(d.letter)
-        self.pending_queue.clear()
-        self.waiting_set.clear()
-        self._plan_and_start()
+        self._plan_busy = True
+        try:
+            for d in self.pending_queue:
+                self._ready_to_start.add(d.letter)
+            self.pending_queue.clear()
+            self.waiting_set.clear()
+            self._plan_and_start()
+        finally:
+            self._plan_busy = False
+            if self._plan_pending:
+                self._plan_pending = False
+                QTimer.singleShot(0, self._try_start_queued)
 
     def _update_ext_panel(self):
         self.ext_table.setRowCount(0)
@@ -758,6 +793,12 @@ class MainWindow(QMainWindow):
             self.ext_table.setItem(row, 5, serial_item)
             enc_label = self._get_enclosure_label(d.hw_serial) if d.hw_serial else ""
             self.ext_table.setItem(row, 6, QTableWidgetItem(enc_label))
+            ej_btn = QPushButton("弹出")
+            ej_btn.setEnabled(True)
+            ej_btn.setToolTip("解除占用并弹出此目标硬盘")
+            ej_btn.clicked.connect(
+                lambda checked, l=letter: self._eject_drive(l, 'hd'))
+            self.ext_table.setCellWidget(row, 7, ej_btn)
         if any_full:
             parts = []
             for letter, sn in full_info:
@@ -1039,9 +1080,21 @@ class MainWindow(QMainWindow):
         self.tray.showMessage("传输完成", f"SD卡 {letter}: 已传输 {format_size(bytes_tx)}", QSystemTrayIcon.Information, 5000)
         QApplication.beep()
         self.processing.discard(letter)
-        self.workers.pop(letter, None)
+        old_w = self.workers.pop(letter, None)
+        if old_w is not None:
+            # Wait for the thread to actually finish so its QThread object
+            # is never destroyed while still running (prevents hard crash)
+            try:
+                if old_w.isRunning():
+                    old_w.wait(5000)
+            except Exception:
+                pass
+            try:
+                old_w.deleteLater()
+            except Exception:
+                pass
         self._update_status_bar()
-        QTimer.singleShot(500, self._try_start_queued)
+        self._schedule_plan()
 
     def _on_failed(self, letter, error):
         # Mark completed to prevent auto-restart loop (user can manually restart)
@@ -1077,7 +1130,18 @@ class MainWindow(QMainWindow):
             self.tray.showMessage("传输失败", f"SD卡 {letter}: {error}", QSystemTrayIcon.Critical, 10000)
             self._set_sd_button(letter, "重试")
         self.processing.discard(letter)
-        self.workers.pop(letter, None)
+        old_w = self.workers.pop(letter, None)
+        if old_w is not None:
+            try:
+                if old_w.isRunning():
+                    old_w.wait(5000)
+            except Exception:
+                pass
+            try:
+                old_w.deleteLater()
+            except Exception:
+                pass
+        self._schedule_plan()
         self._update_status_bar()
         QTimer.singleShot(500, self._try_start_queued)
 
@@ -1122,6 +1186,36 @@ class MainWindow(QMainWindow):
         btn.setEnabled(False)
         btn.clicked.connect(lambda checked, l=d.letter: self._on_action_btn(l))
         self.sd_table.setCellWidget(row, 7, btn)
+        ej_btn = QPushButton("弹出")
+        ej_btn.setEnabled(True)
+        ej_btn.setToolTip("解除占用并弹出此SD卡")
+        ej_btn.clicked.connect(lambda checked, l=d.letter: self._eject_drive(l, 'sd'))
+        self.sd_table.setCellWidget(row, 8, ej_btn)
+
+    def _eject_drive(self, letter, kind):
+        """弹出指定驱动器, 先解除占用。kind: 'sd' 或 'hd'"""
+        if letter in self.processing:
+            QMessageBox.warning(
+                self, "无法弹出",
+                f"盘符 {letter}: 正在传输中, 请先取消传输再弹出。")
+            return
+        # 解除占用
+        release_drive_handles(letter)
+        ok = eject_drive(letter)
+        if ok:
+            self._log(f"[{letter}] 已手动弹出")
+            if kind == 'sd':
+                self._update_sd_status(letter, "已弹出")
+                self._completed_sd.add(letter)
+            self.tray.showMessage(
+                "已弹出", f"盘符 {letter}: 已安全弹出",
+                QSystemTrayIcon.Information, 3000)
+        else:
+            self._log(f"[{letter}] 弹出失败, 请手动弹出")
+            QMessageBox.warning(
+                self, "弹出失败",
+                f"盘符 {letter}: 弹出失败。\n"
+                f"可能有程序正在占用, 请关闭相关程序后重试, 或在任务栏托盘手动弹出。")
 
     def _set_sd_button(self, letter, text):
         row = self._find_row(letter)

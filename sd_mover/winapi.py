@@ -379,3 +379,30 @@ def pop_refresh_done():
             _refresh_done_drives = None
             return drives
         return None
+
+
+def release_drive_handles(drive_letter):
+    """尝试释放占用, 为弹出做准备(通过 LockVolume/DismountVolume)"""
+    try:
+        volume_path = f"\\\\.\\{drive_letter}:"
+        handle = _kernel32.CreateFileW(
+            volume_path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            return False
+        bytes_returned = ctypes.c_ulong(0)
+        _kernel32.DeviceIoControl(
+            handle, FSCTL_LOCK_VOLUME,
+            None, 0, None, 0, ctypes.byref(bytes_returned), None
+        )
+        _kernel32.DeviceIoControl(
+            handle, FSCTL_DISMOUNT_VOLUME,
+            None, 0, None, 0, ctypes.byref(bytes_returned), None
+        )
+        _kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        return False
