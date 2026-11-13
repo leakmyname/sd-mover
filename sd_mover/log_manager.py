@@ -30,10 +30,14 @@ class LogManager:
         """写入简洁的传输记录 - 一行一条, 一眼能看懂"""
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         size_str = format_size(bytes_tx)
+        # 部分完成时把跳过的字节数也写进记录, 对账时能看出差了多少
+        skip_str = ""
+        if status and '部分' in status:
+            skip_str = f", 跳过{format_size(note)}" if note else ", 有跳过"
         line = (
             f"{ts} | SD卡 {sd_letter}: ({sd_label}) {sd_size} | "
             f"-> {dest_letter}: ({dest_label}) | "
-            f"{folder} | {size_str} | {file_count}个文件 | [{status}]\n"
+            f"{folder} | {size_str} | {file_count}个文件 | [{status}{skip_str}]\n"
         )
         with open(self.record_path, 'a', encoding='utf-8') as f:
             f.write(line)
@@ -52,7 +56,8 @@ class LogManager:
                 date_str = parts[0].strip()[:10]
                 size_str = parts[4].strip()
                 status = parts[6].strip()
-                if '完成' not in status:
+                # 只统计真正搬完的卡。带"部分"的是没搬完的, 不能计入对账。
+                if '完成' not in status or '部分' in status:
                     continue
                 size_bytes = self._parse_size(size_str)
                 if date_str not in daily_data:
@@ -98,19 +103,27 @@ class LogManager:
 
     def add_transfer(self, sd_letter, sd_label, sd_size,
                      dest_letter, dest_label, folder,
-                     bytes_tx, file_count, status, note=''):
+                     bytes_tx, file_count, status, note='', skipped_bytes=0):
         self.log_transfer(
             sd_letter, sd_label, sd_size,
             dest_letter, dest_label, folder,
             bytes_tx, file_count, status, note
         )
         stats = self.load_session_stats()
-        if '完成' in status:
+        # 对账口径: 只有"完整搬完一块卡"才计数。
+        # 部分完成(有放不下的文件被跳过)不计入张数, 也不计入总量,
+        # 否则每日汇总会虚增, 和实际搬过去的量对不上。
+        full_ok = ('完成' in status) and ('部分' not in status)
+        if full_ok:
             stats['total_sd_cards'] += 1
             stats['total_bytes'] += bytes_tx
             stats['total_files'] += file_count
             if dest_letter and dest_letter not in stats.get('drives_used', []):
                 stats.setdefault('drives_used', []).append(dest_letter)
+        else:
+            stats['partial_count'] = stats.get('partial_count', 0) + 1
+            stats['partial_bytes_skipped'] = stats.get(
+                'partial_bytes_skipped', 0) + int(skipped_bytes or 0)
         self.save_session_stats(stats)
         return stats
 

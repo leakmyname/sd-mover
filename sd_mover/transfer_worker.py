@@ -101,7 +101,10 @@ class TransferWorker(QThread):
     # letter, copied, total, fname, speed, file_copied, file_total
     progress_updated = pyqtSignal(str, float, float, str, float, float, float)
     status_changed = pyqtSignal(str, str)
-    transfer_completed = pyqtSignal(str, str, str, float, int)
+    # letter, dest_letter, dest_path, bytes, file_count, skipped_bytes
+    # skipped_bytes>0 表示有文件因放不下被跳过(部分成功),
+    # 对账时不能算作"完整搬完一块硬盘"。
+    transfer_completed = pyqtSignal(str, str, str, float, int, float)
     transfer_failed = pyqtSignal(str, str)
     log_message = pyqtSignal(str)
     dest_changed = pyqtSignal(str, str)
@@ -208,7 +211,7 @@ class TransferWorker(QThread):
                 self.status_changed.emit(letter, "无数据")
                 if self.auto_eject and not self.test_mode:
                     self._do_eject(letter)
-                self.transfer_completed.emit(letter, "", "", 0, 0)
+                self.transfer_completed.emit(letter, "", "", 0, 0, 0)
                 return
 
             self.log_message.emit(
@@ -523,7 +526,8 @@ class TransferWorker(QThread):
                 self.log_message.emit(f"[{letter}] 有跳过文件, 不弹出SD卡")
 
             self.transfer_completed.emit(
-                letter, current_dest_letter, current_dest_path, copied, len(files)
+                letter, current_dest_letter, current_dest_path, copied,
+                len(files), skipped
             )
         except Exception as e:
             self.transfer_failed.emit(letter, str(e))

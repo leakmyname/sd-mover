@@ -1179,10 +1179,11 @@ class MainWindow(QMainWindow):
             else:
                 eta_item.setText("--")
 
-    def _on_completed(self, letter, dest_letter, dest_path, bytes_tx, file_count):
+    def _on_completed(self, letter, dest_letter, dest_path, bytes_tx,
+                      file_count, skipped_bytes=0):
         try:
             self._on_completed_impl(letter, dest_letter, dest_path,
-                                    bytes_tx, file_count)
+                                   bytes_tx, file_count, skipped_bytes)
         except Exception as e:
             self._log(f"[{letter}] 完成回调异常: {e}")
             # 确保 worker 依然被清理, 不要卡在 processing 里
@@ -1200,14 +1201,25 @@ class MainWindow(QMainWindow):
                     pass
             self._schedule_plan()
 
-    def _on_completed_impl(self, letter, dest_letter, dest_path, bytes_tx, file_count):
+    def _on_completed_impl(self, letter, dest_letter, dest_path, bytes_tx,
+                           file_count, skipped_bytes=0):
+        # 部分成功(有文件放不下被跳过)时: SD卡上的数据不完整搬完,
+        # 不能计入"今天搬完几块盘"的对账, 也不计入总量。
+        full_ok = (skipped_bytes or 0) <= 0
         self.session_transferred += bytes_tx
-        self.session_sd_count += 1
+        if full_ok:
+            self.session_sd_count += 1
         if self.test_mode_cb.isChecked():
             self._test_processed.add(letter)
         # Mark as completed so auto-poll won't restart it (prevents delete loop)
         self._completed_sd.add(letter)
-        self._log(f"[{letter}] [OK] 传输完成: {format_size(bytes_tx)} -> {dest_letter}: {dest_path}")
+        if full_ok:
+            self._log(f"[{letter}] [OK] 传输完成: {format_size(bytes_tx)} -> {dest_letter}: {dest_path}")
+        else:
+            self._log(
+                f"[{letter}] [部分] 有文件放不下被跳过 {format_size(skipped_bytes)}: "
+                f"已传 {format_size(bytes_tx)} -> {dest_letter}: {dest_path}"
+            )
         row = self._find_row(letter)
         if row >= 0:
             bar = self.sd_table.cellWidget(row, 4)
@@ -1220,7 +1232,11 @@ class MainWindow(QMainWindow):
             eta_item = self.sd_table.item(row, 6)
             if eta_item:
                 eta_item.setText("已完成")
-            self._update_sd_status(letter, "已完成")
+            if full_ok:
+                self._update_sd_status(letter, "已完成")
+            else:
+                # 显眼提示: 这块盘没搬完, 别以为成功了
+                self._update_sd_status(letter, "部分完成(有跳过)")
         sd = self.sd_cards.get(letter)
         sd_label = sd.label if sd else ""
         sd_size = format_size(sd.total) if sd else ""
@@ -1232,11 +1248,21 @@ class MainWindow(QMainWindow):
             sd_letter=letter, sd_label=sd_label, sd_size=sd_size,
             dest_letter=dest_letter, dest_label=dest_label,
             folder=folder_name, bytes_tx=bytes_tx,
-            file_count=file_count, status="完成"
+            file_count=file_count, status=("完成" if full_ok else "部分完成"),
+            skipped_bytes=skipped_bytes,
+            note=int(skipped_bytes or 0) if not full_ok else 0
         )
         self._update_stats_label()
-        self.tray.showMessage("传输完成", f"SD卡 {letter}: 已传输 {format_size(bytes_tx)}", QSystemTrayIcon.Information, 5000)
-        QApplication.beep()
+        if full_ok:
+            self.tray.showMessage("传输完成", f"SD卡 {letter}: 已传输 {format_size(bytes_tx)}", QSystemTrayIcon.Information, 5000)
+            QApplication.beep()
+        else:
+            self.tray.showMessage(
+                "部分完成(有文件放不下)",
+                f"SD卡 {letter}: 已传 {format_size(bytes_tx)}, "
+                f"跳过 {format_size(skipped_bytes)}。SD卡数据未清空, 请换盘重试。",
+                QSystemTrayIcon.Warning, 12000
+            )
         self.processing.discard(letter)
         old_w = self.workers.pop(letter, None)
         if old_w is not None:
