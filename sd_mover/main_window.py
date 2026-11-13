@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
         self._completed_sd = set()  # SD letters already completed (avoid auto-restart loop)
         self._ready_to_start = set()
         self._card_folder_map = {}  # letter -> (ego_num, folder_name, dest_letter) for resume
+        self._last_plans = {}        # letter -> [(dest_letter, bytes)] 本批次的真实分配方案
         self._plan_busy = False
         self._plan_pending = False
         self._serial_refreshing = False
@@ -209,7 +210,8 @@ class MainWindow(QMainWindow):
         # SD卡列表
         sd_group = QGroupBox("SD卡列表")
         sd_layout = QVBoxLayout(sd_group)
-        self.sd_table = QTableWidget(0, 9)
+        # 列数必须与表头一致(10列), 否则越界的 setCellWidget 会被 Qt 静默丢弃
+        self.sd_table = QTableWidget(0, 10)
         self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","暂停","取消/开始","弹出"])
         h = self.sd_table.horizontalHeader()
         h.setSectionResizeMode(6, QHeaderView.Stretch)
@@ -771,6 +773,8 @@ class MainWindow(QMainWindow):
                 bind_count[bl] += 1
                 active_dests.add(bl)
             self._ready_to_start.discard(card.letter)
+            # 记录本批次的真实分配方案(每块盘实际预占多少字节), 便于对账/测试
+            self._last_plans[card.letter] = [(bl, take) for bl, take in plan]
             self._start_transfer(card, forced_primary=plan[0][0])
             started += 1
 
