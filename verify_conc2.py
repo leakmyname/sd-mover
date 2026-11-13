@@ -84,8 +84,14 @@ def scenario_multi_disk_spread():
     w._plan_and_start()
     primaries = [p for _, p in w._started]
     print("  started=%s" % (w._started,))
-    check("all 3 cards started (800G total fits 800G free)",
-          len(w._started) == 3, "n=%d" % len(w._started))
+    # max_hd=2 是"同一时刻最多写几块硬盘"的硬上限: 3张卡也只有2张能同时开工,
+    # 第3张必须排队(等某张卡写完释放目标盘), 不能铺开到第3块盘。
+    check("max_hd=2 -> exactly 2 cards started",
+          len(w._started) == 2, "n=%d" % len(w._started))
+    check("3rd card queued waiting for a free disk",
+          len(w.waiting_set) == 1 or len(w.pending_queue) == 1,
+          "waiting=%s queue=%s" % (sorted(w.waiting_set),
+                                   [d.letter for d in w.pending_queue]))
     check("cards spread across BOTH disks",
           set(primaries) == {'M', 'N'}, "primaries=%s" % primaries)
     # 用计划器记录的真实分配方案校验: 每块盘预占的字节不得超过其剩余空间

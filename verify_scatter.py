@@ -20,7 +20,10 @@ class FakeSD:
         self.total = total
         self.free = free
         self.label = 'SDXC'
-        self.serial = 1
+        # serial 必须是 0: transfer_worker._source_identity_changed() 会用
+        # get_volume_info() 读真实卷序列号来比对, 假的 serial=1 会被判成
+        # "源卡已被更换"而立刻停止传输(什么都不拷)。0 表示无法比对, 跳过校验。
+        self.serial = 0
         self.reader_serial = ''
 
     @property

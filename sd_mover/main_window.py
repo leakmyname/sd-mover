@@ -67,6 +67,29 @@ def format_eta(seconds):
     return f"{h:.1f}小时"
 
 
+def _pick_primary_disk(cands, active, bind_count, max_hd):
+    """从候选盘 cands [(letter, usable), ...] 里选主盘。
+
+    规则:
+      1. 还没被任何卡绑定的盘(unused)优先 —— 这样多张卡会铺开到不同盘,
+         实现用户要的"同时写 N 块硬盘"; 若已达 max_hd 并发上限,
+         则本次无法再开新的写入目标, 返回 None 让卡排队等待
+         (max_hd 是"同一时刻最多写几块硬盘", 不是"每块盘最多几张卡")。
+      2. 绑定数少的优先 —— 把卡均匀铺开, 避免全挤到同一块盘。
+      3. 剩余空间小的优先 —— 先填满小盘。
+    选不到返回 None, 表示当前无法开工, 应排队等待。
+    """
+    if not cands:
+        return None
+    if len(active) >= max_hd:
+        return None
+    unused = [c for c in cands if c[0] not in active]
+    if not unused:
+        return None
+    pool = unused
+    return min(pool, key=lambda x: (bind_count[x[0]], x[1]))[0]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -714,7 +737,10 @@ class MainWindow(QMainWindow):
         for w in self.workers.values():
             if w.primary_dest in bind_count:
                 bind_count[w.primary_dest] += 1
-                reserved[w.primary_dest] += (w.sd_info.total - w.sd_info.free)
+                # 只预占"还没写进去的部分": 已经拷过去的字节不应重复计入,
+                # 否则续传/已写一半的卡会被当成占满整块盘而选不中。
+                remaining_w = max(0, w.sd_info.total - w.sd_info.free - w.copied_bytes)
+                reserved[w.primary_dest] += remaining_w
 
         for card in ready:
             if started >= max_sd:
@@ -736,22 +762,42 @@ class MainWindow(QMainWindow):
                     self._ready_to_start.discard(card.letter)
                     self._queue_sd(card)
                     continue
-                # 先填满小盘: 优先剩余空间小的盘, bind_count 仅作 tiebreaker
-                best = min(cands, key=lambda x: (x[1], bind_count[x[0]]))
-                plan = [(best[0], data_size)]
+                # 选盘: 未绑定过的盘优先(并行铺开) -> 绑定数少 -> 空间小(先填小盘)
+                best = _pick_primary_disk(cands, active_dests, bind_count, max_hd)
+                if not best:
+                    self._ready_to_start.discard(card.letter)
+                    self._queue_sd(card)
+                    continue
+                plan = [(best, data_size)]
             else:
                 # 打散模式: 依次把数据分摊到多块盘(先填满小盘, 再并行少的盘),
                 # 每块盘只预占真正写得进去的字节数。这样多张卡就不会同时看到
                 # 同一块盘的相同剩余空间而全部挤进去, 导致写出一堆不完整的文件。
                 remaining = data_size
                 plan = []
+                first = _pick_primary_disk(
+                    [(l, u) for l, u in usable.items() if u > 0],
+                    active_dests, bind_count, max_hd)
+                if not first:
+                    # 所有盘都装不下 / 并发盘数已满: 排队等新硬盘, 不硬塞
+                    self._ready_to_start.discard(card.letter)
+                    self._queue_sd(card)
+                    continue
                 while remaining > 0:
                     taken = [p[0] for p in plan]
+                    if not plan:
+                        # 主盘必须用 _pick_primary_disk 选出来的那块:
+                        # 它已经考虑过 max_hd 并发盘数上限与"先填满小盘",
+                        # 这里若再按空间重新挑一次, 就会绕过并发限制,
+                        # 导致配了"同时写1块盘"却仍然铺开到多块盘。
+                        plan.append((first, min(remaining, usable[first])))
+                        remaining -= plan[-1][1]
+                        continue
                     cands = [(l, u) for l, u in usable.items()
                              if u > 0 and l not in taken]
                     if not cands:
                         break
-                    bl = min(cands, key=lambda x: (x[1], bind_count[x[0]]))[0]
+                    bl = min(cands, key=lambda x: (bind_count[x[0]], x[1]))[0]
                     take = min(remaining, usable[bl])
                     plan.append((bl, take))
                     remaining -= take
@@ -761,17 +807,14 @@ class MainWindow(QMainWindow):
                     self._queue_sd(card)
                     continue
 
-            # 并发盘数上限: 本批次新用到的盘数不能把 active_dests 撑超 max_hd
-            new_disks = [l for l, _ in plan if l not in active_dests]
-            if new_disks and len(active_dests) + len(new_disks) > max_hd:
-                self._ready_to_start.discard(card.letter)
-                self._queue_sd(card)
-                continue
-
             for bl, take in plan:
                 reserved[bl] += take
                 bind_count[bl] += 1
-                active_dests.add(bl)
+            # active_dests 只累计主盘: 溢出是同一张卡顺序写完一个再写下一个,
+            # 不是并发, 不能把并发盘数撑爆。
+            # 必须在调 _start_transfer 之前生效, 否则同一批次里后面几张卡
+            # 看到的还是旧的并发盘数, 导致 max_hd 限制被绕过。
+            active_dests.add(plan[0][0])
             self._ready_to_start.discard(card.letter)
             # 记录本批次的真实分配方案(每块盘实际预占多少字节), 便于对账/测试
             self._last_plans[card.letter] = [(bl, take) for bl, take in plan]
@@ -970,15 +1013,32 @@ class MainWindow(QMainWindow):
                 if w.primary_dest in bind_count:
                     bind_count[w.primary_dest] += 1
             # 选盘优先级:
-            # 1. 剩余空间小 (先填满小盘, 用户明确要求)
-            # 2. 能装下所有数据的盘 (重要, 否则要溢出)
-            # 3. 绑定数最少 (并行写入)
-            best = min(all_dests_full, key=lambda x: (
-                x[2],                            # 先填满小盘
-                0 if x[2] >= data_size else 1,  # 能装下优先
-                bind_count[x[0]],               # 最后并行
-            ))
-            primary_dest = best[0]
+            # 1. 没被其他卡绑定的盘优先 (让多张卡铺开到不同盘 -> 同时写多块硬盘)
+            # 2. 绑定数最少 (均匀铺开)
+            # 3. 剩余空间小 (先填满小盘)
+            # 4. 打散模式下不要求整盘装下(可溢出); 整体模式下装不下就排队
+            if not scatter:
+                cands = [(l, f) for l, r, f in all_dests_full if f >= data_size]
+            else:
+                cands = [(l, f) for l, r, f in all_dests_full if f > 0]
+            active = set()
+            for w in self.workers.values():
+                if w.primary_dest in bind_count:
+                    active.add(w.primary_dest)
+            best = _pick_primary_disk(cands, active, bind_count,
+                                      self.max_concurrent_hd_spin.value())
+            if not best:
+                hint = ("没有目标盘能装下SD卡数据"
+                        if not scatter else "并发盘数已满")
+                self._log(
+                    f"[{d.letter}] {hint}"
+                    f"({format_size(data_size)}), 已排队等待"
+                )
+                self.processing.discard(d.letter)
+                self._ready_to_start.discard(d.letter)
+                self._queue_sd(d)
+                return
+            primary_dest = best
         if all_dests_full:
             # 整体文件模式: 如果没有盘能装下整个SD卡数据, 不开始传输
             if not scatter:
@@ -1305,6 +1365,20 @@ class MainWindow(QMainWindow):
         if error == "CANCELLED":
             self._update_sd_status(letter, "已取消")
             self._log(f"[{letter}] 传输已取消")
+            self._set_sd_button(letter, "开始")
+        elif error == "SOURCE_CHANGED":
+            # 源卡在传输中途被拔出/换成了另一张卡: 已写入的数据留在目标盘,
+            # 新卡原样保留, 绝不删除/弹出
+            self._update_sd_status(letter, "卡已更换(未删除)")
+            self._log(
+                f"[{letter}] [严重] 源卡已更换或拔出, 传输已停止。"
+                f"新卡数据未删除, 请检查后重新插入需要转存的卡")
+            self.warning_banner.setText(
+                f"!! SD卡 {letter}: 检测到换卡/拔卡, 已停止并保留数据, 请重新插入 !!"
+            )
+            self.warning_banner.show()
+            if not self._blink_timer.isActive():
+                self._blink_timer.start(500)
             self._set_sd_button(letter, "开始")
         elif error == "GAVE_UP":
             self._update_sd_status(letter, "已忽略")

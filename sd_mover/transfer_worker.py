@@ -8,7 +8,7 @@ from datetime import datetime
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from .winapi import format_size, eject_drive, get_disk_usage
+from .winapi import format_size, eject_drive, get_disk_usage, get_volume_info
 from .constants import CHUNK_SIZE, SKIP_ITEMS, MAX_PATH_LEN
 
 
@@ -243,7 +243,8 @@ class TransferWorker(QThread):
             copied = 0
             errors = []
             file_idx = 0
-            copied_files = set()
+            # fpath -> 枚举时记录的大小; 清空前逐个复核, 防止误删被改动的源文件
+            copied_files = {}
             current_dest_letter = ""
             current_dest_path = ""
             dest_idx = 0
@@ -258,6 +259,15 @@ class TransferWorker(QThread):
             while file_idx < len(files):
                 if self.is_cancelled:
                     self._cancelled(letter, copied)
+                    return
+                # 数据安全: 每个文件前确认源卡还是原来那张, 防止换卡后读到
+                # 新卡里同名文件、传完后把新卡清空
+                if self._source_identity_changed():
+                    self.log_message.emit(
+                        f"[{letter}] [严重] 源卡已被更换! 已停止传输并保留数据, "
+                        f"已传 {format_size(copied)}")
+                    self.status_changed.emit(letter, "卡已更换(未删除)")
+                    self.transfer_failed.emit(letter, "SOURCE_CHANGED")
                     return
                 # 暂停: 阻塞在这里, 直到 resume/cancel
                 if not self._pause_event.is_set():
@@ -419,7 +429,7 @@ class TransferWorker(QThread):
                     if rel in self._resume_map:
                         copied += fsize
                         self.copied_bytes = copied
-                        copied_files.add(fpath)
+                        copied_files[fpath] = fsize
                         file_idx += 1
                         self.progress_updated.emit(
                             letter, copied, total_size,
@@ -433,7 +443,7 @@ class TransferWorker(QThread):
                             # 已完整拷贝过该文件, 跳过并计入进度
                             copied += fsize
                             self.copied_bytes = copied
-                            copied_files.add(fpath)
+                            copied_files[fpath] = fsize
                             file_idx += 1
                             self.log_message.emit(
                                 f"[{letter}] 续传: 已存在, 跳过 {os.path.basename(fpath)}"
@@ -462,7 +472,7 @@ class TransferWorker(QThread):
                 try:
                     os.makedirs(_long_path(os.path.dirname(dst_path)), exist_ok=True)
                     copied = self._copy_file(fpath, dst_path, copied, total_size, fname, fsize)
-                    copied_files.add(fpath)
+                    copied_files[fpath] = fsize
                     file_idx += 1
                 except Exception as e:
                     if isinstance(e, RuntimeError) and "Cancelled" in str(e):
@@ -508,18 +518,34 @@ class TransferWorker(QThread):
             elif errors:
                 self.log_message.emit(f"[{letter}] 完成, {len(errors)} 个错误")
 
+            # ── 数据安全: 若源盘在传输过程中被拔掉并换成了另一张卡,
+            #    绝不能再清空/弹出(否则会删掉用户刚插入的新卡数据) ──
+            source_swapped = all_ok and self._source_identity_changed()
+            if source_swapped:
+                self.log_message.emit(
+                    f"[{letter}] [严重] 检测到源卡已被更换/拔出! "
+                    f"已停止清空和弹出, 新插入卡的数据完整保留"
+                )
+                self.status_changed.emit(letter, "卡已更换(未删除)")
+                self.transfer_failed.emit(letter, "SOURCE_CHANGED")
+                return
+
             # 只有all_ok才清空SD卡; partial_ok不删除(有文件没传)
             if all_ok and self.auto_delete and not self.is_cancelled and not self.test_mode:
                 self.status_changed.emit(letter, "清空SD卡...")
-                self._clear_sd(src_root, letter)
+                # 只删除本次成功拷贝过的源文件, 绝不整盘删除
+                self._clear_sd(src_root, letter, copied_files)
             elif all_ok and self.test_mode:
                 self.log_message.emit(f"[{letter}] 测试模式: 跳过删除SD卡文件")
             elif partial_ok:
                 self.log_message.emit(f"[{letter}] 有跳过文件, 保留SD卡数据")
 
             # all_ok才弹出; partial_ok不弹出(保留数据让用户处理)
-            if all_ok and self.auto_eject and not self.is_cancelled and not self.test_mode:
+            if all_ok and self.auto_eject and not self.is_cancelled and not self.test_mode \
+                    and not self._source_identity_changed():
                 self._do_eject(letter)
+            elif all_ok and not self.test_mode and self._source_identity_changed():
+                self.log_message.emit(f"[{letter}] 源卡已更换, 不弹出")
             elif all_ok and self.test_mode:
                 self.log_message.emit(f"[{letter}] 测试模式: 跳过弹出SD卡")
             elif partial_ok:
@@ -604,11 +630,17 @@ class TransferWorker(QThread):
     def _partial_cleanup(self, letter, copied_files):
         self.status_changed.emit(letter, "清理已传输文件...")
         count = 0
-        for fpath in copied_files:
+        for fpath, expected in list(copied_files.items()):
             if self.is_cancelled:
                 break
+            # 删除前复核大小, 被改动的文件保留不动
             try:
-                os.remove(fpath)
+                if os.path.getsize(_long_path(fpath)) != expected:
+                    continue
+            except OSError:
+                continue
+            try:
+                os.remove(_long_path(fpath))
                 count += 1
             except Exception:
                 pass
@@ -626,21 +658,71 @@ class TransferWorker(QThread):
             f"[{letter}] 已清理 {count} 个已传输文件, 保留未传输文件"
         )
 
-    def _clear_sd(self, root, letter):
-        for item in os.listdir(root):
+    def _read_source_serial(self):
+        """读取源盘当前的卷序列号; 读不到(卡已拔出)返回 None"""
+        try:
+            _label, serial, _fs = get_volume_info(self.sd_info.root)
+            return int(serial) if serial else None
+        except Exception:
+            return None
+
+    def _source_identity_changed(self):
+        """源卡是否已被拔出/更换。开头记录的卷序列号为0时无法比对, 视为未变。"""
+        original = int(getattr(self.sd_info, 'serial', 0) or 0)
+        if original <= 0:
+            return False
+        now = self._read_source_serial()
+        return now != original
+
+    def _clear_sd(self, root, letter, copied_files=None):
+        """只删除本次已成功完整拷贝的源文件, 绝不整盘清空。
+
+        双重保险:
+          1. 只删 copied_files 里登记过的文件;
+          2. 删除前复核文件大小与枚举时一致, 被改动/替换过的一律保留。
+        这样即使换卡、相机仍在写入、或有未枚举到的残留文件, 都不会误删。
+        """
+        copied_files = copied_files or {}
+        if self._source_identity_changed():
+            self.log_message.emit(
+                f"[{letter}] 源卡已被更换, 取消清空, 保留新卡数据")
+            return
+        deleted = 0
+        for fpath, expected in list(copied_files.items()):
             if self.is_cancelled:
                 break
-            if item.lower() in SKIP_ITEMS:
-                continue
-            p = os.path.join(root, item)
             try:
-                if os.path.isfile(p) or os.path.islink(p):
-                    os.remove(p)
-                elif os.path.isdir(p):
-                    shutil.rmtree(p)
+                if os.path.getsize(_long_path(fpath)) != expected:
+                    self.log_message.emit(
+                        f"[{letter}] 源文件已被改动, 保留不删: "
+                        f"{os.path.basename(fpath)}")
+                    continue
+            except OSError:
+                # 文件已不在(卡被拔出) -> 跳过
+                continue
+            try:
+                os.remove(_long_path(fpath))
+                deleted += 1
             except Exception as e:
-                self.log_message.emit(f"[{letter}] 删除失败: {item} - {e}")
-        self.log_message.emit(f"[{letter}] SD卡已清空")
+                self.log_message.emit(
+                    f"[{letter}] 删除失败: {os.path.basename(fpath)} - {e}")
+        # 清理变空的子目录(不碰根目录)
+        try:
+            for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+                if os.path.normcase(os.path.abspath(dirpath)) == \
+                        os.path.normcase(os.path.abspath(root)):
+                    continue
+                if self.is_cancelled:
+                    break
+                try:
+                    if not os.listdir(_long_path(dirpath)):
+                        os.rmdir(_long_path(dirpath))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.log_message.emit(
+            f"[{letter}] SD卡已清空 (删除 {deleted} 个已拷贝文件)")
 
     def _do_eject(self, letter):
         self.status_changed.emit(letter, "弹出中...")
