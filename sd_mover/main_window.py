@@ -37,13 +37,20 @@ from .log_manager import LogManager
 
 
 def _safe_slot(fn):
-    """装饰器: 捕获槽函数中的异常, 记录到日志, 防止PyQt5未处理异常导致闪退"""
-    def wrapper(self, *args, **kwargs):
+    """装饰器: 捕获槽函数中的异常, 记录到日志, 防止PyQt5未处理异常导致闪退。
+
+    既可用于类方法 @_safe_slot, 也可用于实例方法上动态生成的闭包
+    (此时调用方传 fn=self._xxx_impl, wrapper 不应再注入 self)。
+    """
+    def wrapper(*args, **kwargs):
         try:
-            return fn(self, *args, **kwargs)
+            return fn(*args, **kwargs)
         except Exception as e:
             try:
-                self._log(f"[内部] {fn.__name__} 异常: {e}")
+                # args[0] 既可能是 self(类方法), 也可能是 MainWindow 实例(闭包)
+                owner = args[0] if args else None
+                if owner is not None and hasattr(owner, '_log'):
+                    owner._log(f"[内部] {getattr(fn, '__name__', fn)} 异常: {e}")
             except Exception:
                 pass
     return wrapper
@@ -83,6 +90,7 @@ class MainWindow(QMainWindow):
         self._test_processed = set()  # SD cards already transferred in test mode
         self._completed_sd = set()  # SD letters already completed (avoid auto-restart loop)
         self._ready_to_start = set()
+        self._card_folder_map = {}  # letter -> (ego_num, folder_name, dest_letter) for resume
         self._plan_busy = False
         self._plan_pending = False
         self._serial_refreshing = False
@@ -581,6 +589,8 @@ class MainWindow(QMainWindow):
             self.pending_queue = [s for s in self.pending_queue if s.letter != letter]
             self._remove_sd_row(letter)
             self._completed_sd.discard(letter)
+            # 卡片已拔出: 清除续传映射, 下次插入的同盘符新卡用全新文件夹
+            self._card_folder_map.pop(letter, None)
         for letter in old_ext - set(ext_new.keys()):
             self._log(f"目标硬盘 {letter}: 已移除")
         self._update_ext_panel()
@@ -933,10 +943,21 @@ class MainWindow(QMainWindow):
         # 所有外部硬盘都作为候选目标盘(不限max_hd, 备选盘也可用于溢出)
         scatter = self.scatter_radio.isChecked()
         data_size = d.total - d.free
+        # 没有任何目标硬盘: 不创建 worker(否则 worker 无盘可写会立刻失败),
+        # 直接排队等待用户插入新硬盘
+        if not all_dests_full:
+            self._log(
+                f"[{d.letter}] 未检测到目标硬盘, 已排队等待 "
+                f"(数据 {format_size(data_size)})"
+            )
+            self.processing.discard(d.letter)
+            self._ready_to_start.discard(d.letter)
+            self._queue_sd(d)
+            return
         # Bind this SD card to a PRIMARY dest: 优先选能装下所有数据的盘
         # 其次考虑并行(绑定数少), 最后选空间最大的
         primary_dest = forced_primary or ""
-        if all_dests_full and not primary_dest:
+        if not primary_dest:
             # Count how many workers are already bound to each drive
             bind_count = {}
             for l, r, _ in all_dests_full:
@@ -978,8 +999,36 @@ class MainWindow(QMainWindow):
                     break
         ego = self._next_ego()
         prefix = self.prefix_edit.text() or DEFAULT_PREFIX
+        # 续传支持: 同一张SD卡重启时复用之前的编号和文件夹名,
+        # 这样 worker 的"目标已存在且大小相同则跳过"逻辑才能生效
+        prev = self._card_folder_map.get(d.letter)
+        # 必须同时满足: 同一个盘符 + 同一块卡(卷序列号一致) + 原目标盘还在,
+        # 才允许续传。仅凭盘符会被"拔卡换卡但盘符瞬间不变"骗过, 导致新卡
+        # 的文件被误判为已传而清空, 造成丢数据。
+        cur_serial = getattr(d, 'serial', 0) or 0
+        prev_matches = bool(
+            prev
+            and cur_serial
+            and prev[3] == cur_serial
+            and prev[2] in [l for l, r, _ in all_dests_full]
+        )
+        if prev_matches:
+            ego, folder_name = prev[0], prev[1]
+            self._log(
+                f"[{d.letter}] 续传: 复用编号 {prefix}{ego:02d} 文件夹 {folder_name}")
+        else:
+            folder_name = ""
+        if not folder_name:
+            # 新卡: 生成新文件夹名, 立刻记入 map, 取消后重启即可复用
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            folder_name = f"{prefix}{ego:02d}_{ts}"
+        self._card_folder_map[d.letter] = (ego, folder_name, primary_dest, cur_serial)
         # dest_roots: 所有盘都传给worker作为候选(打散模式可溢出到其他盘)
         dest_roots = [(l, r) for l, r, _ in all_dests_full]
+        # resume_ok 只在"同一张卡、同一目标盘、取消后点开始"时才为 True。
+        # 不同SD卡的相机文件经常同名同大小, 绝不能仅凭"目标已存在同大小文件"
+        # 就认为已传过 —— 否则会把未拷贝的源文件当成已传而直接删除, 造成丢数据!
+        resume_ok = prev_matches
         worker = TransferWorker(
             sd_info=d, dest_roots=dest_roots,
             ego_num=ego, prefix=prefix,
@@ -989,6 +1038,8 @@ class MainWindow(QMainWindow):
             test_mode=self.test_mode_cb.isChecked(),
             scatter_mode=scatter,
             primary_dest=primary_dest
+            , folder_name=folder_name
+            , resume_ok=resume_ok
         )
         worker.progress_updated.connect(self._on_progress)
         worker.status_changed.connect(self._update_sd_status)

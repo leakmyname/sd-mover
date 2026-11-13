@@ -110,7 +110,8 @@ class TransferWorker(QThread):
     def __init__(self, sd_info, dest_roots, ego_num, prefix,
                 auto_eject=True, auto_delete=True,
                 reader_serial="", test_mode=False,
-                scatter_mode=True, primary_dest=""):
+                 scatter_mode=True, primary_dest="", folder_name="",
+                 resume_ok=False):
         super().__init__()
         self.sd_info = sd_info
         self.dest_roots = dest_roots  # [(letter, path), ...]
@@ -132,6 +133,12 @@ class TransferWorker(QThread):
         self._new_dests = []
         self._dest_lock = threading.Lock()
         self._folder_name = ""  # consistent folder name per SD card
+        self._folder_name = folder_name or ""  # reuse folder name on restart
+        # resume_ok: 仅当"取消后点开始重跑同一张卡"时才允许按目标已存在跳过。
+        # 绝不能用"目标已存在同大小文件"推断已传过 —— 不同SD卡的相机文件
+        # 经常同名同大小, 误判会把还没拷贝的源文件当成已传而直接删除, 造成丢数据!
+        self._resume_ok = resume_ok
+        self._folder_generated_here = False  # True when folder name auto-generated
         self._pause_event = threading.Event()
         self._pause_event.set()  # not paused by default
         self.copied_bytes = 0   # total bytes written so far (thread-safe read)
@@ -170,6 +177,12 @@ class TransferWorker(QThread):
     def run(self):
         letter = self.sd_info.letter
         src_root = self.sd_info.root
+        # 文件夹名统一由 main_window 生成并传入(保证与 _card_folder_map 一致,
+        # 取消后重启才能复用同一文件夹实现续传)。兜底仅在直接构造时生效。
+        if not self._folder_name:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self._folder_name = f"{self.prefix}{self.ego_num:02d}_{ts}"
+            self._folder_generated_here = True
         try:
             self.status_changed.emit(letter, "扫描文件...")
             files = []
@@ -386,9 +399,6 @@ class TransferWorker(QThread):
 
                 # Use consistent folder name per SD card across all dest drives
                 # so files from same SD card are easy to find
-                if not hasattr(self, '_folder_name') or not self._folder_name:
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    self._folder_name = f"{self.prefix}{self.ego_num:02d}_{ts}"
                 if dest_letter != current_dest_letter:
                     folder = self._folder_name
                     dest = os.path.join(dest_root, folder)
@@ -402,35 +412,36 @@ class TransferWorker(QThread):
 
                 rel = os.path.relpath(fpath, src_root)
                 # ── 续传: 目标已存在同样大小的文件, 说明上次已传完, 跳过 ──
-                if rel in self._resume_map:
-                    copied += fsize
-                    self.copied_bytes = copied
-                    copied_files.add(fpath)
-                    file_idx += 1
-                    self.progress_updated.emit(
-                        letter, copied, total_size,
-                        f"[续传跳过] {os.path.basename(fpath)}",
-                        0, 0, 0)
-                    continue
-                _cand_dst = os.path.join(current_dest_path, rel)
-                try:
-                    _exist_size = os.path.getsize(_long_path(_cand_dst))
-                    if _exist_size == fsize and fsize > 0:
-                        # 已完整拷贝过该文件, 跳过并计入进度
+                if self._resume_ok:
+                    if rel in self._resume_map:
                         copied += fsize
                         self.copied_bytes = copied
                         copied_files.add(fpath)
                         file_idx += 1
-                        self.log_message.emit(
-                            f"[{letter}] 续传: 已存在, 跳过 {os.path.basename(fpath)}"
-                        )
                         self.progress_updated.emit(
                             letter, copied, total_size,
                             f"[续传跳过] {os.path.basename(fpath)}",
                             0, 0, 0)
                         continue
-                except OSError:
-                    pass
+                    _cand_dst = os.path.join(current_dest_path, rel)
+                    try:
+                        _exist_size = os.path.getsize(_long_path(_cand_dst))
+                        if _exist_size == fsize and fsize > 0:
+                            # 已完整拷贝过该文件, 跳过并计入进度
+                            copied += fsize
+                            self.copied_bytes = copied
+                            copied_files.add(fpath)
+                            file_idx += 1
+                            self.log_message.emit(
+                                f"[{letter}] 续传: 已存在, 跳过 {os.path.basename(fpath)}"
+                            )
+                            self.progress_updated.emit(
+                                letter, copied, total_size,
+                                f"[续传跳过] {os.path.basename(fpath)}",
+                                0, 0, 0)
+                            continue
+                    except OSError:
+                        pass
                 # 检查目标路径长度, 如果太长则截断
                 base_dest_len = len(current_dest_path)
                 rel_len = len(rel)
