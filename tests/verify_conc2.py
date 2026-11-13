@@ -8,7 +8,7 @@
 不走 _poll_drives(), 避免 _test_processed 与 old_sd 干扰。
 """
 import os, sys, time, shutil, traceback
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QCoreApplication

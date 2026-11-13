@@ -3,7 +3,7 @@
 用户的原始抱怨: 日志写 [OK]传输完成: 0.0B -> R:..., 每日汇总虚增 1 张 0.0B
 """
 import os, sys, tempfile, shutil
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sd_mover.log_manager import LogManager
 
 results = []

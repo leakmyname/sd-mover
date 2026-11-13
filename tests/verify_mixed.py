@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """验证: 256G + 512G SD 卡混插, 防闪退, 取消后续传"""
 import os, sys, time, traceback
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt5.QtWidgets import QApplication
 app = QApplication(sys.argv)
 from sd_mover.drive_info import DriveInfo

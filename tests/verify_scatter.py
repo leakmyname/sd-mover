@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """验证打散模式: 主盘写满后自动溢出到下一块盘, 不产生不完整文件"""
-import os, sys, time, shutil, traceback
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import os, sys, time, shutil, traceback, tempfile
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(TESTS_DIR)
+sys.path.insert(0, REPO_ROOT)
+TMP_ROOT = os.path.join(tempfile.gettempdir(), 'sdm_verify')
+os.makedirs(TMP_ROOT, exist_ok=True)
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
 from PyQt5.QtWidgets import QApplication
@@ -127,7 +131,7 @@ def _incomplete(d1, d2, sd):
 
 def scenario_overflow_spreads_across_disks():
     print("\n=== SCENARIO: scatter overflow across disks ===", flush=True)
-    base = r'C:\sd_test_scatter'
+    base = os.path.join(TMP_ROOT, 'scatter')
     sd, total = _mk_sd(base, [(3, 150 * 1024 * 1024)])
     d1 = os.path.join(base, 'D1'); d2 = os.path.join(base, 'D2')
     os.makedirs(d1); os.makedirs(d2)
@@ -144,7 +148,7 @@ def scenario_overflow_spreads_across_disks():
 
 def scenario_big_files_on_small_disk():
     print("\n=== SCENARIO: big files on 48GB disk ===", flush=True)
-    base = r'C:\sd_test_scatter2'
+    base = os.path.join(TMP_ROOT, 'scatter2')
     sd, total = _mk_sd(base, [(1, 200 * 1024 * 1024), (1, 200 * 1024 * 1024),
                                (1, 200 * 1024 * 1024)])
     d1 = os.path.join(base, 'D1'); d2 = os.path.join(base, 'D2')
@@ -161,7 +165,7 @@ def scenario_big_files_on_small_disk():
 
 def scenario_copied_bytes_monotonic():
     print("\n=== SCENARIO: copied_bytes monotonic ===", flush=True)
-    base = r'C:\sd_test_mono'
+    base = os.path.join(TMP_ROOT, 'mono')
     sd, total = _mk_sd(base, [(5, 10 * 1024 * 1024)])
     d1 = os.path.join(base, 'D1'); d2 = os.path.join(base, 'D2')
     os.makedirs(d1); os.makedirs(d2)
@@ -189,7 +193,7 @@ def scenario_copied_bytes_monotonic():
 
 def scenario_cancel_removes_partial_file():
     print("\n=== SCENARIO: cancel removes partial file ===", flush=True)
-    base = r'C:\sd_test_cancel'
+    base = os.path.join(TMP_ROOT, 'cancel')
     sd, total = _mk_sd(base, [(1, 500 * 1024 * 1024)])
     d1 = os.path.join(base, 'D1'); d2 = os.path.join(base, 'D2')
     os.makedirs(d1); os.makedirs(d2)
@@ -234,7 +238,7 @@ def scenario_cancel_removes_partial_file():
 
 def scenario_cancel_mid_copy_deletes_partial():
     print("\n=== SCENARIO: cancel mid-copy deletes partial file ===", flush=True)
-    base = r'C:\sd_test_midcancel'
+    base = os.path.join(TMP_ROOT, 'midcancel')
     sd, total = _mk_sd(base, [(1, 300 * 1024 * 1024)])
     d1 = os.path.join(base, 'D1')
     if os.path.isdir(d1):

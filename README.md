@@ -27,6 +27,14 @@ sd_mover/
 run.py                 # 直接运行入口
 build_exe.bat          # Windows 打包脚本
 requirements.txt       # 依赖
+
+tests/                  # 逻辑验证脚本(不碰真实存储设备)
+  run_all.py           # python tests/run_all.py 一次跑完
+  verify_plan.py       # 并发选盘/预占/排队(max_hd 硬上限)
+  verify_acct.py       # 对账只统计完整搬完的卡 + 每日汇总
+  verify_mixed.py      # 256G/512G 混插 + 续传续用同一目录
+  verify_scatter.py    # 打散溢出不产生半个文件 + 取消清理
+  verify_conc2.py      # 多卡铺开到多块盘 + 进度/ETA/按钮列
 ```
 
 ## 打包
@@ -44,6 +52,8 @@ pyinstaller --onefile --name sd_mover --windowed --noconfirm --clean --add-data 
 ```
 
 输出：`dist\sd_mover.exe`（约 30MB，单文件）
+
+测试脚本用假盘符和系统临时目录跑，不会读写任何真实 SD 卡或移动硬盘。
 
 ## 使用方法
 

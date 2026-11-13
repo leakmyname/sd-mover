@@ -8,7 +8,7 @@
 4. 多卡同时看到同一块盘的相同剩余空间而全部挤进去(过订阅)
 """
 import os, sys, types
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 results = []
 GB = 1024 ** 3
