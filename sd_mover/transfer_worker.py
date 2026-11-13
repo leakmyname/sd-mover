@@ -132,11 +132,26 @@ class TransferWorker(QThread):
         self._new_dests = []
         self._dest_lock = threading.Lock()
         self._folder_name = ""  # consistent folder name per SD card
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # not paused by default
+        self.copied_bytes = 0   # total bytes written so far (thread-safe read)
+        self._resume_map = {}   # rel_path -> size, files already on dest
 
     def cancel(self):
         with self._lock:
             self._cancel = True
         self._space_event.set()
+        self._pause_event.set()
+
+    def pause(self):
+        self._pause_event.clear()
+
+    def resume_transfer(self):
+        self._pause_event.set()
+
+    @property
+    def is_paused(self):
+        return not self._pause_event.is_set()
 
     @property
     def is_cancelled(self):
@@ -216,6 +231,7 @@ class TransferWorker(QThread):
             current_dest_letter = ""
             current_dest_path = ""
             dest_idx = 0
+            self.copied_bytes = 0
 
             self.status_changed.emit(letter, "传输中")
             self._start_time = time.time()
@@ -227,6 +243,20 @@ class TransferWorker(QThread):
                 if self.is_cancelled:
                     self._cancelled(letter, copied)
                     return
+                # 暂停: 阻塞在这里, 直到 resume/cancel
+                if not self._pause_event.is_set():
+                    self.status_changed.emit(letter, "已暂停")
+                    self.log_message.emit(f"[{letter}] 已暂停")
+                    _paused_at = time.time()
+                    while not self._pause_event.wait(0.3):
+                        if self.is_cancelled:
+                            self._cancelled(letter, copied)
+                            return
+                    # 恢复: 暂停时长不计入总耗时(否则速度/ETA会被拖慢)
+                    if not self.is_cancelled:
+                        self._start_time += time.time() - _paused_at
+                        self.status_changed.emit(letter, "传输中")
+                        self.log_message.emit(f"[{letter}] 已继续传输")
 
                 # Collect newly added dests and re-sort so primary_dest leads
                 with self._dest_lock:
@@ -371,6 +401,36 @@ class TransferWorker(QThread):
                     )
 
                 rel = os.path.relpath(fpath, src_root)
+                # ── 续传: 目标已存在同样大小的文件, 说明上次已传完, 跳过 ──
+                if rel in self._resume_map:
+                    copied += fsize
+                    self.copied_bytes = copied
+                    copied_files.add(fpath)
+                    file_idx += 1
+                    self.progress_updated.emit(
+                        letter, copied, total_size,
+                        f"[续传跳过] {os.path.basename(fpath)}",
+                        0, 0, 0)
+                    continue
+                _cand_dst = os.path.join(current_dest_path, rel)
+                try:
+                    _exist_size = os.path.getsize(_long_path(_cand_dst))
+                    if _exist_size == fsize and fsize > 0:
+                        # 已完整拷贝过该文件, 跳过并计入进度
+                        copied += fsize
+                        self.copied_bytes = copied
+                        copied_files.add(fpath)
+                        file_idx += 1
+                        self.log_message.emit(
+                            f"[{letter}] 续传: 已存在, 跳过 {os.path.basename(fpath)}"
+                        )
+                        self.progress_updated.emit(
+                            letter, copied, total_size,
+                            f"[续传跳过] {os.path.basename(fpath)}",
+                            0, 0, 0)
+                        continue
+                except OSError:
+                    pass
                 # 检查目标路径长度, 如果太长则截断
                 base_dest_len = len(current_dest_path)
                 rel_len = len(rel)

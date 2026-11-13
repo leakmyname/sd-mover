@@ -35,6 +35,18 @@ from .winapi import (
 from .log_manager import LogManager
 
 
+def _safe_slot(fn):
+    """装饰器: 捕获槽函数中的异常, 记录到日志, 防止PyQt5未处理异常导致闪退"""
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as e:
+            try:
+                self._log(f"[内部] {fn.__name__} 异常: {e}")
+            except Exception:
+                pass
+    return wrapper
+
 def format_eta(seconds):
     """格式化预估时间"""
     if seconds < 1:
@@ -475,6 +487,12 @@ class MainWindow(QMainWindow):
         )
 
     def _check_serial_refresh(self):
+        @_safe_slot
+        def _inner():
+            self._check_serial_refresh_impl()
+        _inner()
+
+    def _check_serial_refresh_impl(self):
         done_drives = pop_refresh_done()
         if done_drives is not None:
             self._serial_refreshing = False
@@ -507,6 +525,12 @@ class MainWindow(QMainWindow):
         self._update_ext_panel()
 
     def _poll_drives(self):
+        @_safe_slot
+        def _inner():
+            self._poll_drives_impl()
+        _inner()
+
+    def _poll_drives_impl(self):
         try:
             min_gb = self.min_size_spin.value()
             drives = scan_drives(min_ext_gb=min_gb)
@@ -608,6 +632,12 @@ class MainWindow(QMainWindow):
         self.delay_tick[d.letter] = tick
 
     def _delay_tick_cb(self, letter):
+        @_safe_slot
+        def _inner():
+            self._delay_tick_cb_impl(letter)
+        _inner()
+
+    def _delay_tick_cb_impl(self, letter):
         if letter not in self.delay_remaining:
             self._cancel_delay(letter)
             return
@@ -763,6 +793,12 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self._try_start_queued)
 
     def _update_ext_panel(self):
+        @_safe_slot
+        def _inner():
+            self._update_ext_panel_impl()
+        _inner()
+
+    def _update_ext_panel_impl(self):
         self.ext_table.setRowCount(0)
         any_full = False
         full_info = []
@@ -823,6 +859,12 @@ class MainWindow(QMainWindow):
                 self._blink_timer.stop()
 
     def _blink_warning(self):
+        @_safe_slot
+        def _inner():
+            self._blink_warning_impl()
+        _inner()
+
+    def _blink_warning_impl(self):
         self._blink_state = not self._blink_state
         if self._blink_state:
             self.warning_banner.setStyleSheet("background-color: #ff0000; color: white; font-size: 16px; font-weight: bold; padding: 10px; border-radius: 4px;")
@@ -1252,6 +1294,12 @@ class MainWindow(QMainWindow):
         self.sd_table.setCellWidget(row, 8, ej_btn)
 
     def _eject_drive(self, letter, kind):
+        @_safe_slot
+        def _inner():
+            self._eject_drive_impl(letter, kind)
+        _inner()
+
+    def _eject_drive_impl(self, letter, kind):
         """弹出指定驱动器, 先解除占用。kind: 'sd' 或 'hd'"""
         if letter in self.processing:
             QMessageBox.warning(
@@ -1297,6 +1345,12 @@ class MainWindow(QMainWindow):
         return -1
 
     def _update_sd_status(self, letter, status):
+        @_safe_slot
+        def _inner():
+            self._update_sd_status_impl(letter, status)
+        _inner()
+
+    def _update_sd_status_impl(self, letter, status):
         row = self._find_row(letter)
         if row < 0:
             return
