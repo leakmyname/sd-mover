@@ -4,6 +4,7 @@ import os
 import sys
 import re
 import json
+import time
 from datetime import datetime
 from typing import Dict, Set, Optional
 
@@ -201,11 +202,13 @@ class MainWindow(QMainWindow):
         sd_group = QGroupBox("SD卡列表")
         sd_layout = QVBoxLayout(sd_group)
         self.sd_table = QTableWidget(0, 9)
-        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","操作","弹出"])
+        self.sd_table.setHorizontalHeaderLabels(["盘符","标签","容量","状态","进度","速度","剩余时间","暂停","取消/开始","弹出"])
         h = self.sd_table.horizontalHeader()
         h.setSectionResizeMode(6, QHeaderView.Stretch)
         h.setSectionResizeMode(4, QHeaderView.Fixed)
         h.setSectionResizeMode(7, QHeaderView.Fixed)
+        h.setSectionResizeMode(8, QHeaderView.Fixed)
+        h.setSectionResizeMode(9, QHeaderView.Fixed)
         self.sd_table.setColumnWidth(0, 50)
         self.sd_table.setColumnWidth(1, 80)
         self.sd_table.setColumnWidth(2, 80)
@@ -213,7 +216,8 @@ class MainWindow(QMainWindow):
         self.sd_table.setColumnWidth(4, 180)
         self.sd_table.setColumnWidth(5, 90)
         self.sd_table.setColumnWidth(7, 80)
-        self.sd_table.setColumnWidth(8, 60)
+        self.sd_table.setColumnWidth(8, 80)
+        self.sd_table.setColumnWidth(9, 60)
         self.sd_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sd_table.setSelectionMode(QAbstractItemView.NoSelection)
         sd_layout.addWidget(self.sd_table)
@@ -720,10 +724,11 @@ class MainWindow(QMainWindow):
                     self._ready_to_start.discard(card.letter)
                     self._queue_sd(card)
                     continue
-                best = min(cands, key=lambda x: (bind_count[x[0]], x[1]))
+                # 先填满小盘: 优先剩余空间小的盘, bind_count 仅作 tiebreaker
+                best = min(cands, key=lambda x: (x[1], bind_count[x[0]]))
                 plan = [(best[0], data_size)]
             else:
-                # 打散模式: 依次把数据分摊到多块盘(先并行少的盘, 再先填满小盘),
+                # 打散模式: 依次把数据分摊到多块盘(先填满小盘, 再并行少的盘),
                 # 每块盘只预占真正写得进去的字节数。这样多张卡就不会同时看到
                 # 同一块盘的相同剩余空间而全部挤进去, 导致写出一堆不完整的文件。
                 remaining = data_size
@@ -734,7 +739,7 @@ class MainWindow(QMainWindow):
                              if u > 0 and l not in taken]
                     if not cands:
                         break
-                    bl = min(cands, key=lambda x: (bind_count[x[0]], x[1]))[0]
+                    bl = min(cands, key=lambda x: (x[1], bind_count[x[0]]))[0]
                     take = min(remaining, usable[bl])
                     plan.append((bl, take))
                     remaining -= take
@@ -849,14 +854,27 @@ class MainWindow(QMainWindow):
             if not self._blink_timer.isActive():
                 self._blink_timer.start(500)
             sn_text = "; ".join(f"{l} SN:{s}" for l, s in full_info)
-            self.tray.showMessage(
-                "硬盘已满", f"序列号: {sn_text}",
-                QSystemTrayIcon.Warning, 8000
-            )
+            # 防抖: 同一组满的硬盘 10 分钟内只弹一次托盘通知,
+            # 否则每 2 秒轮询一次会疯狂刷屏
+            now = time.time()
+            last_key = getattr(self, '_last_full_key', None)
+            last_ts = getattr(self, '_last_full_notify', 0.0)
+            cur_key = sn_text
+            if cur_key != last_key or (now - last_ts) > 600:
+                self._last_full_key = cur_key
+                self._last_full_notify = now
+                self.tray.showMessage(
+                    "硬盘已满", f"序列号: {sn_text}",
+                    QSystemTrayIcon.Warning, 8000
+                )
+                self._log(f"[警告] 目标盘空间不足: {sn_text}")
         else:
             self.warning_banner.hide()
             if self._blink_timer.isActive():
                 self._blink_timer.stop()
+            # 没有满盘时清空防抖状态, 下次满盘立即通知
+            self._last_full_key = None
+            self._last_full_notify = 0.0
 
     def _blink_warning(self):
         @_safe_slot
@@ -927,13 +945,13 @@ class MainWindow(QMainWindow):
                 if w.primary_dest in bind_count:
                     bind_count[w.primary_dest] += 1
             # 选盘优先级:
-            # 1. 能装下所有数据的盘 (最重要!)
-            # 2. 绑定数最少 (并行写入)
-            # 3. 剩余空间最小 (先填满小盘)
+            # 1. 剩余空间小 (先填满小盘, 用户明确要求)
+            # 2. 能装下所有数据的盘 (重要, 否则要溢出)
+            # 3. 绑定数最少 (并行写入)
             best = min(all_dests_full, key=lambda x: (
-                0 if x[2] >= data_size else 1,  # 能装下优先!
-                bind_count[x[0]],               # 其次并行
-                x[2]                             # 最后空间小(先填满小盘)
+                x[2],                            # 先填满小盘
+                0 if x[2] >= data_size else 1,  # 能装下优先
+                bind_count[x[0]],               # 最后并行
             ))
             primary_dest = best[0]
         if all_dests_full:
@@ -1028,10 +1046,13 @@ class MainWindow(QMainWindow):
             self.activateWindow()
             self.setWindowState(
                 self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
-            reply = box.exec_()
+            box.exec_()
         finally:
             self._need_space_busy = None
-        if reply == QMessageBox.RejectRole:
+        # exec_() 返回的是按钮的 StandardButton 值, 不是 Role;
+        # 用 clickedButton() 比较按钮对象才可靠
+        clicked = box.clickedButton()
+        if clicked == ign_btn:
             worker.give_up()
             self._log(f"[{letter}] 用户选择忽略, 放弃未传输部分")
         else:
@@ -1247,18 +1268,28 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._try_start_queued)
 
     def _on_action_btn(self, letter):
+        @_safe_slot
+        def _inner():
+            self._on_action_btn_impl(letter)
+        _inner()
+
+    def _on_action_btn_impl(self, letter):
         btn_text = ""
         row = self._find_row(letter)
         if row >= 0:
-            btn = self.sd_table.cellWidget(row, 7)
+            btn = self.sd_table.cellWidget(row, 8)
             if btn:
                 btn_text = btn.text()
         if btn_text == "取消":
             worker = self.workers.get(letter)
             if worker:
+                # 暂停中也要能取消: 先解除暂停再取消
+                if worker.is_paused:
+                    worker.resume_transfer()
                 worker.cancel()
                 self._log(f"[{letter}] 用户取消传输")
                 self._update_sd_status(letter, "取消中...")
+                self._set_pause_button(letter, "暂停", enabled=False)
         elif btn_text in ("开始", "重试"):
             d = self.sd_cards.get(letter)
             if d:
@@ -1268,6 +1299,25 @@ class MainWindow(QMainWindow):
                 self._completed_sd.discard(letter)
                 self._check_and_start(d)
                 self._log(f"[{letter}] 重新开始传输")
+
+    def _on_pause_btn(self, letter):
+        @_safe_slot
+        def _inner():
+            self._on_pause_btn_impl(letter)
+        _inner()
+
+    def _on_pause_btn_impl(self, letter):
+        worker = self.workers.get(letter)
+        if not worker:
+            return
+        if worker.is_paused:
+            worker.resume_transfer()
+            self._set_pause_button(letter, "暂停", enabled=True)
+            self._log(f"[{letter}] 用户继续传输")
+        else:
+            worker.pause()
+            self._set_pause_button(letter, "继续", enabled=True)
+            self._log(f"[{letter}] 用户暂停传输")
 
     def _add_sd_row(self, d):
         row = self.sd_table.rowCount()
@@ -1283,15 +1333,21 @@ class MainWindow(QMainWindow):
         self.sd_table.setCellWidget(row, 4, bar)
         self.sd_table.setItem(row, 5, QTableWidgetItem("--"))
         self.sd_table.setItem(row, 6, QTableWidgetItem("--"))
+        pause_btn = QPushButton("暂停")
+        pause_btn.setEnabled(False)
+        pause_btn.setToolTip("暂停/继续此SD卡的传输")
+        pause_btn.clicked.connect(lambda checked, l=d.letter: self._on_pause_btn(l))
+        self.sd_table.setCellWidget(row, 7, pause_btn)
         btn = QPushButton("取消")
         btn.setEnabled(False)
+        btn.setToolTip("取消后重新点开始将续传(跳过已传完的文件)")
         btn.clicked.connect(lambda checked, l=d.letter: self._on_action_btn(l))
-        self.sd_table.setCellWidget(row, 7, btn)
+        self.sd_table.setCellWidget(row, 8, btn)
         ej_btn = QPushButton("弹出")
         ej_btn.setEnabled(True)
         ej_btn.setToolTip("解除占用并弹出此SD卡")
         ej_btn.clicked.connect(lambda checked, l=d.letter: self._eject_drive(l, 'sd'))
-        self.sd_table.setCellWidget(row, 8, ej_btn)
+        self.sd_table.setCellWidget(row, 9, ej_btn)
 
     def _eject_drive(self, letter, kind):
         @_safe_slot
@@ -1327,10 +1383,18 @@ class MainWindow(QMainWindow):
     def _set_sd_button(self, letter, text):
         row = self._find_row(letter)
         if row >= 0:
-            btn = self.sd_table.cellWidget(row, 7)
+            btn = self.sd_table.cellWidget(row, 8)
             if btn:
                 btn.setText(text)
                 btn.setEnabled(True)
+
+    def _set_pause_button(self, letter, text, enabled=True):
+        row = self._find_row(letter)
+        if row >= 0:
+            btn = self.sd_table.cellWidget(row, 7)
+            if btn:
+                btn.setText(text)
+                btn.setEnabled(enabled)
 
     def _remove_sd_row(self, letter):
         row = self._find_row(letter)
@@ -1370,12 +1434,20 @@ class MainWindow(QMainWindow):
             "已取消": QColor(128, 128, 128),
         }
         item.setForeground(colors.get(status, QColor(0, 0, 0)))
+        # 同步暂停按钮状态
+        if status in ("传输中",):
+            self._set_pause_button(letter, "暂停", enabled=True)
+        elif status in ("已暂停",):
+            self._set_pause_button(letter, "继续", enabled=True)
+        elif status in ("已完成", "已弹出", "已取消", "已忽略", "失败",
+                        "设备断开", "取消中...", "无数据"):
+            self._set_pause_button(letter, "暂停", enabled=False)
         if status == "传输中":
             self._set_sd_button(letter, "取消")
         elif status in ("已完成", "已弹出"):
             row2 = self._find_row(letter)
             if row2 >= 0:
-                btn = self.sd_table.cellWidget(row2, 7)
+                btn = self.sd_table.cellWidget(row2, 8)
                 if btn:
                     btn.setText("已完成")
                     btn.setEnabled(False)
